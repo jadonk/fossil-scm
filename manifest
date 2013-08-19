@@ -1,6 +1,6 @@
-C Generated\sby\s"merge\s--integrate"
-D 2013-08-16T08:17:43.805
-T +closed ef5e74961acda29e97db547c9e9a92c9f36f3417 5885241f52c6182e92368b19d0da892bb61f9a01
+C Merge\s--integrate\sinto\s[12c30d33d477c812]
+D 2013-08-19T13:21:57.749
+T +closed 908a090c88a2d58ea981f8c7e635bffda7d0a53a
 U jan.nijtmans
-Z 9e676a65fa5385112b5e8b9d16957773
+Z f6c124803aa226eabf5e751ee3d6914f
 # Remove this line to create a well-formed Fossil manifest.
