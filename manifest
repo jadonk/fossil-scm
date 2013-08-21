@@ -1,6 +1,8 @@
-C Merge\s--integrate\sinto\s[12c30d33d477c812]
-D 2013-08-19T13:21:57.749
-T +closed 908a090c88a2d58ea981f8c7e635bffda7d0a53a
+C this\sshould\sbe\sa\svalid\smanifest
+D 2013-08-21T14:49:41.624
+T +closed *
+T +closed 43779170059202c9ad6d1ca1c65437d0784f5e4b
+T +closed d10eee3a4b091bf3ab08273e7cde38e93e30769b
 U jan.nijtmans
-Z f6c124803aa226eabf5e751ee3d6914f
+Z 926433891aeda6be33ffe6177049ad64
 # Remove this line to create a well-formed Fossil manifest.
