@@ -1,8 +1,8 @@
-C this\sshould\sbe\sa\svalid\smanifest
-D 2013-08-21T14:49:41.624
-T +closed *
-T +closed 43779170059202c9ad6d1ca1c65437d0784f5e4b
-T +closed d10eee3a4b091bf3ab08273e7cde38e93e30769b
+C This\ssummary\sshould\sbe\ssorted\son\sUUID:\s
+D 2013-08-24T21:29:00.571
+T *branch a5479f189bf3459f99e7ab6029456ce4c4fae230 trunk
+T +user 2549a3a51b1c61734cc4e78a1dd0353b62ab31bd jan.nijtmans
+T +user a5479f189bf3459f99e7ab6029456ce4c4fae230 jan.nijtmans
 U jan.nijtmans
-Z 926433891aeda6be33ffe6177049ad64
+Z 7f1433276308819d53b4456198909173
 # Remove this line to create a well-formed Fossil manifest.
