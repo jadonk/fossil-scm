@@ -28,10 +28,10 @@
 ** propagated and that the tag is already present in pid.
 **
 ** If tagtype is 2 then the tag is being propagated from an
-** ancestor node.  If tagtype is 0 it means a branch tag is
-** being cancelled.
+** ancestor node.  If tagtype is 0 it means a propagating tag is
+** being blocked.
 */
-void tag_propagate(
+static void tag_propagate(
   int pid,             /* Propagate the tag to children of this node */
   int tagid,           /* Tag to propagate */
   int tagType,         /* 2 for a propagating tag.  0 for an antitag */
@@ -39,21 +39,30 @@ void tag_propagate(
   const char *zValue,  /* Value of the tag.  Might be NULL */
   double mtime         /* Timestamp on the tag */
 ){
-  PQueue queue;
-  Stmt s, ins, eventupdate;
+  PQueue queue;        /* Queue of check-ins to be tagged */
+  Stmt s;              /* Query the children of :pid to which to propagate */
+  Stmt ins;            /* INSERT INTO tagxref */
+  Stmt eventupdate;    /* UPDATE event */
 
   assert( tagType==0 || tagType==2 );
-  pqueue_init(&queue);
-  pqueue_insert(&queue, pid, 0.0);
-  db_prepare(&s, 
+  pqueuex_init(&queue);
+  pqueuex_insert(&queue, pid, 0.0, 0);
+
+  /* Query for children of :pid to which to propagate the tag.
+  ** Three returns:  (1) rid of the child.  (2) timestamp of child.
+  ** (3) True to propagate or false to block.
+  */
+  db_prepare(&s,
      "SELECT cid, plink.mtime,"
      "       coalesce(srcid=0 AND tagxref.mtime<:mtime, %d) AS doit"
      "  FROM plink LEFT JOIN tagxref ON cid=rid AND tagid=%d"
      " WHERE pid=:pid AND isprim",
-     tagType!=0, tagid
+     tagType==2, tagid
   );
   db_bind_double(&s, ":mtime", mtime);
+
   if( tagType==2 ){
+    /* Set the propagated tag marker on check-in :rid */
     db_prepare(&ins,
        "REPLACE INTO tagxref(tagid, tagtype, srcid, origid, value, mtime, rid)"
        "VALUES(%d,2,0,%d,%Q,:mtime,:rid)",
@@ -61,6 +70,7 @@ void tag_propagate(
     );
     db_bind_double(&ins, ":mtime", mtime);
   }else{
+    /* Remove all references to the tag from check-in :rid */
     zValue = 0;
     db_prepare(&ins,
        "DELETE FROM tagxref WHERE tagid=%d AND rid=:rid", tagid
@@ -71,14 +81,14 @@ void tag_propagate(
       "UPDATE event SET bgcolor=%Q WHERE objid=:rid", zValue
     );
   }
-  while( (pid = pqueue_extract(&queue))!=0 ){
+  while( (pid = pqueuex_extract(&queue, 0))!=0 ){
     db_bind_int(&s, ":pid", pid);
     while( db_step(&s)==SQLITE_ROW ){
       int doit = db_column_int(&s, 2);
       if( doit ){
         int cid = db_column_int(&s, 0);
         double mtime = db_column_double(&s, 1);
-        pqueue_insert(&queue, cid, mtime);
+        pqueuex_insert(&queue, cid, mtime, 0);
         db_bind_int(&ins, ":rid", cid);
         db_step(&ins);
         db_reset(&ins);
@@ -87,11 +97,14 @@ void tag_propagate(
           db_step(&eventupdate);
           db_reset(&eventupdate);
         }
+        if( tagid==TAG_BRANCH ){
+          leaf_eventually_check(cid);
+        }
       }
     }
     db_reset(&s);
   }
-  pqueue_clear(&queue);
+  pqueuex_clear(&queue);
   db_finalize(&ins);
   db_finalize(&s);
   if( tagid==TAG_BGCOLOR ){
@@ -100,14 +113,13 @@ void tag_propagate(
 }
 
 /*
-** Propagate all propagatable tags in pid to its children.
+** Propagate all propagatable tags in pid to the children of pid.
 */
 void tag_propagate_all(int pid){
   Stmt q;
   db_prepare(&q,
      "SELECT tagid, tagtype, mtime, value, origid FROM tagxref"
-     " WHERE rid=%d"
-     "   AND (tagtype=0 OR tagtype=2)",
+     " WHERE rid=%d",
      pid
   );
   while( db_step(&q)==SQLITE_ROW ){
@@ -116,6 +128,7 @@ void tag_propagate_all(int pid){
     double mtime = db_column_double(&q, 2);
     const char *zValue = db_column_text(&q, 3);
     int origid = db_column_int(&q, 4);
+    if( tagtype==1 ) tagtype = 0;
     tag_propagate(pid, tagid, tagtype, origid, zValue, mtime);
   }
   db_finalize(&q);
@@ -168,7 +181,7 @@ int tag_insert(
     /* Another entry that is more recent already exists.  Do nothing */
     return tagid;
   }
-  db_prepare(&s, 
+  db_prepare(&s,
     "REPLACE INTO tagxref(tagid,tagtype,srcId,origid,value,mtime,rid)"
     " VALUES(%d,%d,%d,%d,%Q,:mtime,%d)",
     tagid, tagtype, srcId, rid, zValue, rid
@@ -176,6 +189,7 @@ int tag_insert(
   db_bind_double(&s, ":mtime", mtime);
   db_step(&s);
   db_finalize(&s);
+  if( tagid==TAG_BRANCH ) leaf_eventually_check(rid);
   if( tagtype==0 ){
     zValue = 0;
   }
@@ -193,9 +207,16 @@ int tag_insert(
       zCol = "euser";
       break;
     }
+    case TAG_PRIVATE: {
+      db_multi_exec(
+        "INSERT OR IGNORE INTO private(rid) VALUES(%d);",
+        rid
+      );
+    }
   }
   if( zCol ){
-    db_multi_exec("UPDATE event SET %s=%Q WHERE objid=%d", zCol, zValue, rid);
+    db_multi_exec("UPDATE event SET \"%w\"=%Q WHERE objid=%d",
+                  zCol, zValue, rid);
     if( tagid==TAG_COMMENT ){
       char *zCopy = mprintf("%s", zValue);
       wiki_extract_links(zCopy, rid, 0, mtime, 1, WIKI_INLINE);
@@ -203,12 +224,14 @@ int tag_insert(
     }
   }
   if( tagid==TAG_DATE ){
-    db_multi_exec("UPDATE event SET mtime=julianday(%Q) WHERE objid=%d",
+    db_multi_exec("UPDATE event "
+                  "   SET mtime=julianday(%Q),"
+                  "       omtime=coalesce(omtime,mtime)"
+                  " WHERE objid=%d",
                   zValue, rid);
   }
-  if( tagtype==0 || tagtype==2 ){
-    tag_propagate(rid, tagid, tagtype, rid, zValue, mtime);
-  }
+  if( tagtype==1 ) tagtype = 0;
+  tag_propagate(rid, tagid, tagtype, rid, zValue, mtime);
   return tagid;
 }
 
@@ -236,7 +259,7 @@ void testtag_cmd(void){
     case '+':  tagtype = 1;  break;
     case '*':  tagtype = 2;  break;
     case '-':  tagtype = 0;  break;
-    default:   
+    default:
       fossil_fatal("tag should begin with '+', '*', or '-'");
       return;
   }
@@ -248,7 +271,7 @@ void testtag_cmd(void){
   zValue = g.argc==5 ? g.argv[4] : 0;
   db_begin_transaction();
   tag_insert(zTag, tagtype, zValue, -1, 0.0, rid);
-  db_end_transaction(0); 
+  db_end_transaction(0);
 }
 
 /*
@@ -276,7 +299,7 @@ void tag_add_artifact(
   user_select();
   blob_zero(&uuid);
   blob_append(&uuid, zObjName, -1);
-  if( name_to_uuid(&uuid, 9) ){
+  if( name_to_uuid(&uuid, 9, "*") ){
     fossil_fatal("%s", g.zErrMsg);
     return;
   }
@@ -294,7 +317,6 @@ void tag_add_artifact(
   }
 #endif
   zDate = date_in_standard_format(zDateOvrd ? zDateOvrd : "now");
-  zDate[10] = 'T';
   blob_appendf(&ctrl, "D %s\n", zDate);
   blob_appendf(&ctrl, "T %c%s%F %b",
                zTagtype[tagtype], zPrefix, zTagname, &uuid);
@@ -303,11 +325,12 @@ void tag_add_artifact(
   }else{
     blob_appendf(&ctrl, "\n");
   }
-  blob_appendf(&ctrl, "U %F\n", zUserOvrd ? zUserOvrd : g.zLogin);
+  blob_appendf(&ctrl, "U %F\n", zUserOvrd ? zUserOvrd : login_name());
   md5sum_blob(&ctrl, &cksum);
   blob_appendf(&ctrl, "Z %b\n", &cksum);
-  nrid = content_put(&ctrl, 0, 0);
-  manifest_crosslink(nrid, &ctrl);
+  nrid = content_put(&ctrl);
+  manifest_crosslink(nrid, &ctrl, MC_PERMIT_HOOKS);
+  assert( blob_is_reset(&ctrl) );
 }
 
 /*
@@ -321,18 +344,20 @@ void tag_add_artifact(
 **         Add a new tag or property to CHECK-IN. The tag will
 **         be usable instead of a CHECK-IN in commands such as
 **         update and merge.  If the --propagate flag is present,
-**         the tag value propages to all descendants of CHECK-IN
+**         the tag value propagates to all descendants of CHECK-IN
 **
 **     %fossil tag cancel ?--raw? TAGNAME CHECK-IN
 **
 **         Remove the tag TAGNAME from CHECK-IN, and also remove
 **         the propagation of the tag to any descendants.
 **
-**     %fossil tag find ?--raw? TAGNAME
+**     %fossil tag find ?--raw? ?-t|--type TYPE? ?-n|--limit #? TAGNAME
 **
-**         List all check-ins that use TAGNAME
+**         List all objects that use TAGNAME.  TYPE can be "ci" for
+**         check-ins or "e" for events. The limit option limits the number
+**         of results to the given value.
 **
-**     %fossil tag list ?--raw? ?CHECK-IN?
+**     %fossil tag list|ls ?--raw? ?CHECK-IN?
 **
 **         List all tags, or if CHECK-IN is supplied, list
 **         all tags and their values for CHECK-IN.
@@ -356,9 +381,9 @@ void tag_add_artifact(
 **
 ** will assume that "decaf" is a tag/branch name.
 **
-** only allow --date-override and --user-override in 
-**   %fossil tag add --date-override 'YYYY-MMM-DD HH:MM:SS' \
-**                   --user-override user 
+** only allow --date-override and --user-override in
+**   %fossil tag add --date-override 'YYYY-MMM-DD HH:MM:SS' \\
+**                   --user-override user
 ** in order to import history from other scm systems
 */
 void tag_cmd(void){
@@ -366,8 +391,10 @@ void tag_cmd(void){
   int fRaw = find_option("raw","",0)!=0;
   int fPropagate = find_option("propagate","",0)!=0;
   const char *zPrefix = fRaw ? "" : "sym-";
+  const char *zFindLimit = find_option("limit","n",1);
+  const int nFindLimit = zFindLimit ? atoi(zFindLimit) : -2000;
 
-  db_find_and_open_repository(1);
+  db_find_and_open_repository(0, 0);
   if( g.argc<3 ){
     goto tag_cmd_usage;
   }
@@ -406,44 +433,55 @@ void tag_cmd(void){
 
   if( strncmp(g.argv[2],"find",n)==0 ){
     Stmt q;
+    const char *zType = find_option("type","t",1);
+    Blob sql = empty_blob;
+    if( zType==0 || zType[0]==0 ) zType = "*";
     if( g.argc!=4 ){
-      usage("find ?--raw? TAGNAME");
+      usage("find ?--raw? ?-t|--type TYPE? ?-n|--limit #? TAGNAME");
     }
     if( fRaw ){
-      db_prepare(&q,
+      blob_append_sql(&sql,
         "SELECT blob.uuid FROM tagxref, blob"
         " WHERE tagid=(SELECT tagid FROM tag WHERE tagname=%Q)"
         "   AND tagxref.tagtype>0"
         "   AND blob.rid=tagxref.rid",
         g.argv[3]
       );
+      if( nFindLimit>0 ){
+        blob_append_sql(&sql, " LIMIT %d", nFindLimit);
+      }
+      db_prepare(&q, "%s", blob_sql_text(&sql));
+      blob_reset(&sql);
       while( db_step(&q)==SQLITE_ROW ){
-        printf("%s\n", db_column_text(&q, 0));
+        fossil_print("%s\n", db_column_text(&q, 0));
       }
       db_finalize(&q);
     }else{
       int tagid = db_int(0, "SELECT tagid FROM tag WHERE tagname='sym-%q'",
                          g.argv[3]);
       if( tagid>0 ){
-        db_prepare(&q,
+        blob_append_sql(&sql,
           "%s"
+          "  AND event.type GLOB '%q'"
           "  AND blob.rid IN ("
                     " SELECT rid FROM tagxref"
                     "  WHERE tagtype>0 AND tagid=%d"
                     ")"
           " ORDER BY event.mtime DESC",
-          timeline_query_for_tty(), tagid
+          timeline_query_for_tty(), zType, tagid
         );
-        print_timeline(&q, 2000);
+        db_prepare(&q, "%s", blob_sql_text(&sql));
+        blob_reset(&sql);
+        print_timeline(&q, nFindLimit, 79, 0);
         db_finalize(&q);
       }
     }
   }else
 
-  if( strncmp(g.argv[2],"list",n)==0 ){
+  if(( strncmp(g.argv[2],"list",n)==0 )||( strncmp(g.argv[2],"ls",n)==0 )){
     Stmt q;
     if( g.argc==3 ){
-      db_prepare(&q, 
+      db_prepare(&q,
         "SELECT tagname FROM tag"
         " WHERE EXISTS(SELECT 1 FROM tagxref"
         "               WHERE tagid=tag.tagid"
@@ -453,9 +491,9 @@ void tag_cmd(void){
       while( db_step(&q)==SQLITE_ROW ){
         const char *zName = db_column_text(&q, 0);
         if( fRaw ){
-          printf("%s\n", zName);
+          fossil_print("%s\n", zName);
         }else if( strncmp(zName, "sym-", 4)==0 ){
-          printf("%s\n", &zName[4]);
+          fossil_print("%s\n", &zName[4]);
         }
       }
       db_finalize(&q);
@@ -477,9 +515,9 @@ void tag_cmd(void){
           zName += 4;
         }
         if( zValue && zValue[0] ){
-          printf("%s=%s\n", zName, zValue);
+          fossil_print("%s=%s\n", zName, zValue);
         }else{
-          printf("%s\n", zName);
+          fossil_print("%s\n", zName);
         }
       }
       db_finalize(&q);
@@ -499,17 +537,20 @@ tag_cmd_usage:
 }
 
 /*
-** WEBPAGE: /taglist
+** WEBPAGE: taglist
+**
+** List all non-propagating symbolic tags.
 */
 void taglist_page(void){
   Stmt q;
 
   login_check_credentials();
-  if( !g.okRead ){
-    login_needed();
+  if( !g.perm.Read ){
+    login_needed(g.anon.Read);
   }
   login_anonymous_available();
   style_header("Tags");
+  style_adunit_config(ADUNIT_RIGHT_OK);
   style_submenu_element("Timeline", "Timeline", "tagtimeline");
   @ <h2>Non-propagating tags:</h2>
   db_prepare(&q,
@@ -524,8 +565,8 @@ void taglist_page(void){
   @ <ul>
   while( db_step(&q)==SQLITE_ROW ){
     const char *zName = db_column_text(&q, 0);
-    if( g.okHistory ){
-      @ <li><a class="tagLink" href="%s(g.zBaseURL)/timeline?t=%T(zName)">
+    if( g.perm.Hyperlink ){
+      @ <li>%z(xhref("class='taglink'","%R/timeline?t=%T&n=200",zName))
       @ %h(zName)</a></li>
     }else{
       @ <li><span class="tagDsp">%h(zName)</span></li>
@@ -537,40 +578,16 @@ void taglist_page(void){
 }
 
 /*
-** Draw the names of all tags added to check-in rid.  Only tags
-** that are directly applied to rid are named.  Propagated tags
-** are omitted.
-*/
-static void tagtimeline_extra(int rid){
-  Stmt q;
-  db_prepare(&q, 
-    "SELECT substr(tagname,5) FROM tagxref, tag"
-    " WHERE tagxref.rid=%d"
-    "   AND tagxref.tagid=tag.tagid"
-    "   AND tagxref.tagtype>0 AND tagxref.srcid>0"
-    "   AND tag.tagname GLOB 'sym-*'",
-    rid
-  );
-  while( db_step(&q)==SQLITE_ROW ){
-    const char *zTagName = db_column_text(&q, 0);
-    if( g.okHistory ){
-      @ <a class="tagLink" href="%s(g.zBaseURL)/timeline?t=%T(zTagName)">
-      @ [%h(zTagName)]</a>
-    }else{
-      @ <span class="tagDsp">[%h(zTagName)]</span>
-    }
-  }
-  db_finalize(&q);
-}
-
-/*
 ** WEBPAGE: /tagtimeline
+**
+** Render a timeline with all check-ins that contain non-propagating
+** symbolic tags.
 */
 void tagtimeline_page(void){
   Stmt q;
 
   login_check_credentials();
-  if( !g.okRead ){ login_needed(); return; }
+  if( !g.perm.Read ){ login_needed(g.anon.Read); return; }
 
   style_header("Tagged Check-ins");
   style_submenu_element("List", "List", "taglist");
@@ -584,14 +601,8 @@ void tagtimeline_page(void){
     " ORDER BY event.mtime DESC",
     timeline_query_for_www()
   );
-  www_print_timeline(&q, 0, tagtimeline_extra);
+  www_print_timeline(&q, 0, 0, 0, 0, 0);
   db_finalize(&q);
   @ <br />
-  @ <script  type="text/JavaScript">
-  @ function xin(id){
-  @ }
-  @ function xout(id){
-  @ }
-  @ </script>
   style_footer();
 }

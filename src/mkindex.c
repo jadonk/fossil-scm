@@ -15,8 +15,11 @@
 **
 *******************************************************************************
 **
-** Build a static hash table that maps URLs into functions to generate
-** web pages.
+** This program scans Fossil source code files looking for special
+** comments that indicate a command-line command or a webpage.  This
+** routine collects information about these entry points and then
+** generates (on standard output) C code used by Fossil to dispatch
+** to those entry points.
 **
 ** The source code is scanned for comment lines of the form:
 **
@@ -35,7 +38,19 @@
 **       COMMAND:  cmdname
 **
 ** These entries build a constant table used to map command names into
-** functions.
+** functions.  If cmdname ends with "*" then the command is a second-tier
+** command that is not displayed by the "fossil help" command.  The
+** final "*" is not considered to be part of the command name.
+**
+** Comment text following COMMAND: through the end of the comment is
+** understood to be help text for the command specified.  This help
+** text is accumulated and a table containing the text for each command
+** is generated.  That table is used implement the "fossil help" command
+** and the "/help" HTTP method.
+**
+** Multiple occurrences of WEBPAGE: or COMMAND: (but not both) can appear
+** before each function name.  In this way, webpages and commands can
+** have aliases.
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +63,7 @@
 */
 typedef struct Entry {
   int eType;
+  char *zIf;
   char *zFunc;
   char *zPath;
   char *zHelp;
@@ -61,7 +77,7 @@ typedef struct Entry {
 /*
 ** Maximum size of a help message
 */
-#define MX_HELP 10000
+#define MX_HELP 25000
 
 /*
 ** Table of entries
@@ -73,6 +89,11 @@ Entry aEntry[N_ENTRY];
 */
 char zHelp[MX_HELP];
 int nHelp;
+
+/*
+** Most recently encountered #if
+*/
+char zIf[200];
 
 /*
 ** How many entries are used
@@ -124,14 +145,39 @@ void scan_for_label(const char *zLabel, char *zLine, int eType){
 }
 
 /*
+** Check to see if the current line is an #if and if it is, add it to
+** the zIf[] string.  If the current line is an #endif or #else or #elif
+** then cancel the current zIf[] string.
+*/
+void scan_for_if(const char *zLine){
+  int i;
+  int len;
+  if( zLine[0]!='#' ) return;
+  for(i=1; isspace(zLine[i]); i++){}
+  if( zLine[i]==0 ) return;
+  len = strlen(&zLine[i]);
+  if( memcmp(&zLine[i],"if",2)==0 ){
+    zIf[0] = '#';
+    memcpy(&zIf[1], &zLine[i], len+1);
+  }else if( zLine[i]=='e' ){
+    zIf[0] = 0;
+  }
+}
+
+/*
 ** Scan a line for a function that implements a web page or command.
 */
 void scan_for_func(char *zLine){
   int i,j,k;
   char *z;
   if( nUsed<=nFixed ) return;
-  if( strncmp(zLine, "**", 2)==0 && isspace(zLine[2])
-       && strlen(zLine)<sizeof(zHelp)-nHelp-1 && nUsed>nFixed ){
+  if( strncmp(zLine, "**", 2)==0
+   && isspace(zLine[2])
+   && strlen(zLine)<sizeof(zHelp)-nHelp-1
+   && nUsed>nFixed
+   && memcmp(zLine,"** COMMAND:",11)!=0
+   && memcmp(zLine,"** WEBPAGE:",11)!=0
+  ){
     if( zLine[2]=='\n' ){
       zHelp[nHelp++] = '\n';
     }else{
@@ -162,6 +208,7 @@ void scan_for_func(char *zLine){
     z = 0;
   }
   for(k=nFixed; k<nUsed; k++){
+    aEntry[k].zIf = zIf[0] ? string_dup(zIf, -1) : 0;
     aEntry[k].zFunc = string_dup(&zLine[i], j);
     aEntry[k].zHelp = z;
   }
@@ -172,7 +219,7 @@ void scan_for_func(char *zLine){
   nHelp = 0;
   return;
 
-page_skip:   
+page_skip:
    for(i=nFixed; i<nUsed; i++){
       fprintf(stderr,"%s:%d: skipping page \"%s\"\n",
          zFile, nLine, aEntry[i].zPath);
@@ -198,41 +245,71 @@ int e_compare(const void *a, const void *b){
 */
 void build_table(void){
   int i;
-  int nType0;
 
   qsort(aEntry, nFixed, sizeof(aEntry[0]), e_compare);
   for(i=0; i<nFixed; i++){
+    if( aEntry[i].zIf ) printf("%s", aEntry[i].zIf);
     printf("extern void %s(void);\n", aEntry[i].zFunc);
+    if( aEntry[i].zIf ) printf("#endif\n");
   }
   printf(
     "typedef struct NameMap NameMap;\n"
     "struct NameMap {\n"
     "  const char *zName;\n"
     "  void (*xFunc)(void);\n"
+    "  char cmdFlags;\n"
     "};\n"
+    "#define CMDFLAG_1ST_TIER  0x01\n"
+    "#define CMDFLAG_2ND_TIER  0x02\n"
+    "#define CMDFLAG_TEST      0x04\n"
+    "#define CMDFLAG_WEBPAGE   0x08\n"
     "static const NameMap aWebpage[] = {\n"
   );
   for(i=0; i<nFixed && aEntry[i].eType==0; i++){
-    printf("  { \"%s\",%*s %s },\n",
-      aEntry[i].zPath, (int)(25-strlen(aEntry[i].zPath)), "",
-      aEntry[i].zFunc
+    const char *z = aEntry[i].zPath;
+    int n = strlen(z);
+    if( aEntry[i].zIf ) printf("%s", aEntry[i].zIf);
+    printf("  { \"%s\",%*s %s,%*s 1 },\n",
+      z,
+      25-n, "",
+      aEntry[i].zFunc,
+      (int)(35-strlen(aEntry[i].zFunc)), ""
     );
+    if( aEntry[i].zIf ) printf("#endif\n");
   }
   printf("};\n");
-  nType0 = i;
   printf(
     "static const NameMap aCommand[] = {\n"
   );
-  for(i=nType0; i<nFixed && aEntry[i].eType==1; i++){
-    printf("  { \"%s\",%*s %s },\n",
-      aEntry[i].zPath, (int)(25-strlen(aEntry[i].zPath)), "",
-      aEntry[i].zFunc
+  for(i=0; i<nFixed /*&& aEntry[i].eType==1*/; i++){
+    const char *z = aEntry[i].zPath;
+    int n = strlen(z);
+    int cmdFlags = (1==aEntry[i].eType) ? 0x01 : 0x08;
+    if( 0x01==cmdFlags ){
+      if( z[n-1]=='*' ){
+        n--;
+        cmdFlags = 0x02;
+      }else if( memcmp(z, "test-", 5)==0 ){
+        cmdFlags = 0x04;
+      }
+    }
+    if( aEntry[i].zIf ) printf("%s", aEntry[i].zIf);
+    printf("  { \"%s%.*s\",%*s %s,%*s %d },\n",
+      (0x08 & cmdFlags) ? "/" : "",
+      n, z,
+      25-n, "",
+      aEntry[i].zFunc,
+      (int)(35-strlen(aEntry[i].zFunc)), "",
+      cmdFlags
     );
+    if( aEntry[i].zIf ) printf("#endif\n");
   }
   printf("};\n");
-  for(i=nType0; i<nFixed; i++){
+  printf("#define FOSSIL_FIRST_CMD (sizeof(aWebpage)/sizeof(aWebpage[0]))\n");
+  for(i=0; i<nFixed; i++){
     char *z = aEntry[i].zHelp;
     if( z && z[0] ){
+      if( aEntry[i].zIf ) printf("%s", aEntry[i].zIf);
       printf("static const char zHelp_%s[] = \n", aEntry[i].zFunc);
       printf("  \"");
       while( *z ){
@@ -246,18 +323,23 @@ void build_table(void){
         z++;
       }
       printf("\";\n");
+      if( aEntry[i].zIf ) printf("#endif\n");
       aEntry[i].zHelp[0] = 0;
     }
   }
-  printf(
-    "static const char * const aCmdHelp[] = {\n"
-  );
-  for(i=nType0; i<nFixed; i++){
+  puts("struct CmdHelp {"
+       "int eType; "
+       "const char *zText;"
+       "};");
+  puts("static struct CmdHelp aCmdHelp[] = {");
+  for(i=0; i<nFixed; i++){
+    if( aEntry[i].zIf ) printf("%s", aEntry[i].zIf);
     if( aEntry[i].zHelp==0 ){
-      printf("  0,\n");
+      printf("{%d, 0},\n", aEntry[i].eType);
     }else{
-      printf("  zHelp_%s,\n", aEntry[i].zFunc);
+      printf("{%d, zHelp_%s},\n", aEntry[i].eType, aEntry[i].zFunc);
     }
+    if( aEntry[i].zIf ) printf("#endif\n");
   }
   printf("};\n");
 }
@@ -275,12 +357,13 @@ void process_file(void){
   nLine = 0;
   while( fgets(zLine, sizeof(zLine), in) ){
     nLine++;
+    scan_for_if(zLine);
     scan_for_label("WEBPAGE:",zLine,0);
     scan_for_label("COMMAND:",zLine,1);
     scan_for_func(zLine);
   }
   fclose(in);
-  nUsed = nFixed; 
+  nUsed = nFixed;
 }
 
 int main(int argc, char **argv){

@@ -2,18 +2,12 @@
 # Copyright (c) 2006 D. Richard Hipp
 #
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public
-# License version 2 as published by the Free Software Foundation.
+# modify it under the terms of the Simplified BSD License (also
+# known as the "2-Clause License" or "FreeBSD License".)
 #
 # This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-# General Public License for more details.
-# 
-# You should have received a copy of the GNU General Public
-# License along with this library; if not, write to the
-# Free Software Foundation, Inc., 59 Temple Place - Suite 330,
-# Boston, MA  02111-1307, USA.
+# but without any warranty; without even the implied warranty of
+# merchantability or fitness for a particular purpose.
 #
 # Author contact information:
 #   drh@hwaci.com
@@ -29,6 +23,7 @@
 # is the name of the executable to be tested.
 #
 
+set testrundir [pwd]
 set testdir [file normalize [file dir $argv0]]
 set fossilexe [file normalize [lindex $argv 0]]
 set argv [lrange $argv 1 end]
@@ -41,6 +36,22 @@ if {$i>=0} {
   set HALT 0
 }
 
+set i [lsearch $argv -prot]
+if {$i>=0} {
+  set PROT 1
+  set argv [lreplace $argv $i $i]
+} else {
+  set PROT 0
+}
+
+set i [lsearch $argv -verbose]
+if {$i>=0} {
+  set VERBOSE 1
+  set argv [lreplace $argv $i $i]
+} else {
+  set VERBOSE 0
+}
+
 if {[llength $argv]==0} {
   foreach f [lsort [glob $testdir/*.test]] {
     set base [file root [file tail $f]]
@@ -48,23 +59,83 @@ if {[llength $argv]==0} {
   }
 }
 
-# Run the fossil program
+set tempPath [expr {[info exists env(TEMP)] ? \
+    $env(TEMP) : [file dirname [info script]]}]
+
+if {$tcl_platform(platform) eq "windows"} then {
+  set tempPath [string map [list \\ /] $tempPath]
+}
+
+# start protocol
+#
+proc protInit {cmd} {
+  if {$::PROT} {
+    set out [open [file join $::testrundir prot] w]
+    fconfigure $out -translation platform
+    puts $out "starting tests with: $cmd"
+    close $out
+  }
+}
+
+# write protocol
+#
+proc protOut {msg} {
+  puts stdout $msg
+  if {$::PROT} {
+    set out [open [file join $::testrundir prot] a]
+    fconfigure $out -translation platform
+    puts $out $msg
+    close $out
+  }
+}
+
+# Run the Fossil program with the specified arguments.
+#
+# Consults the VERBOSE global variable to determine if
+# diagnostics should be emitted when no error is seen.
+# Sets the CODE and RESULT global variables for use in
+# test expressions.
 #
 proc fossil {args} {
+  return [uplevel 1 fossil_maybe_answer [list ""] $args]
+}
+
+# Run the Fossil program with the specified arguments
+# and possibly answer the first prompt, if any.
+#
+# Consults the VERBOSE global variable to determine if
+# diagnostics should be emitted when no error is seen.
+# Sets the CODE and RESULT global variables for use in
+# test expressions.
+#
+proc fossil_maybe_answer {answer args} {
   global fossilexe
   set cmd $fossilexe
   foreach a $args {
     lappend cmd $a
   }
-  puts $cmd
+  protOut $cmd
+
   flush stdout
-  set rc [catch {eval exec $cmd} result]
+  if {[string length $answer] > 0} {
+    set prompt_file [file join $::tempPath fossil_prompt_answer]
+    write_file $prompt_file $answer\n
+    set rc [catch {eval exec $cmd <$prompt_file} result]
+    file delete $prompt_file
+  } else {
+    set rc [catch {eval exec $cmd} result]
+  }
   global RESULT CODE
   set CODE $rc
+  if {$rc} {
+    protOut "ERROR: $result"
+  } elseif {$::VERBOSE} {
+    protOut "RESULT: $result"
+  }
   set RESULT $result
 }
 
-# Read a file into memory. 
+# Read a file into memory.
 #
 proc read_file {filename} {
   set in [open $filename r]
@@ -96,15 +167,130 @@ proc same_file {a b} {
   return [expr {$x==$y}]
 }
 
+# Create and open a new Fossil repository and clean the checkout
+#
+proc repo_init {{filename ".rep.fossil"}} {
+  if {$::env(HOME) ne [pwd]} {
+    catch {exec $::fossilexe info} res
+    if {![regexp {use --repository} $res]} {
+      error "In an open checkout: cannot initialize a new repository here."
+    }
+    # Fossil will write data on $HOME, running 'fossil new' here.
+    # We need not to clutter the $HOME of the test caller.
+    #
+    set ::env(HOME) [pwd]
+  }
+  catch {exec $::fossilexe close -f}
+  file delete $filename
+  exec $::fossilexe new $filename
+  exec $::fossilexe open $filename
+  exec $::fossilexe clean -f
+  exec $::fossilexe set mtime-changes off
+}
+
+# Normalize file status lists (like those returned by 'fossil changes')
+# so they can be compared using simple string comparison
+#
+proc normalize_status_list {list} {
+  set normalized [list]
+  set matches [regexp -all -inline -line {^\s*([A-Z_]+:?)\x20+(\S.*)$} $list]
+  foreach {_ status file} $matches {
+    lappend normalized [list $status [string trim $file]]
+  }
+  set normalized [lsort -index 1 $normalized]
+  return $normalized
+}
+
+# Perform a test comparing two status lists
+#
+proc test_status_list {name result expected} {
+  set expected [normalize_status_list $expected]
+  set result [normalize_status_list $result]
+  if {$result eq $expected} {
+    test $name 1
+  } else {
+    protOut "  Expected:\n    [join $expected "\n    "]"
+    protOut "  Got:\n    [join $result "\n    "]"
+    test $name 0
+  }
+}
+
+# Append all arguments into a single value and then returns it.
+#
+proc appendArgs {args} {
+  eval append result $args
+}
+
+# Return the name of the versioned settings file containing the TH1
+# setup script.
+#
+proc getTh1SetupFileName {} {
+  #
+  # NOTE: This uses the "testdir" global variable provided by the
+  #       test suite; alternatively, the root of the source tree
+  #       could be obtained directly from Fossil.
+  #
+  return [file normalize [file join [file dirname $::testdir] \
+      .fossil-settings th1-setup]]
+}
+
+# Return the saved name of the versioned settings file containing
+# the TH1 setup script.
+#
+proc getSavedTh1SetupFileName {} {
+  return [appendArgs [getTh1SetupFileName] . [pid]]
+}
+
+# Sets the TH1 setup script to the one provided.  Prior to calling
+# this, the [saveTh1SetupFile] procedure should be called in order to
+# preserve the existing TH1 setup script.  Prior to completing the test,
+# the [restoreTh1SetupFile] procedure should be called to restore the
+# original TH1 setup script.
+#
+proc writeTh1SetupFile { data } {
+  return [write_file [getTh1SetupFileName] $data]
+}
+
+# Saves the TH1 setup script file by renaming it, based on the current
+# process ID.
+#
+proc saveTh1SetupFile {} {
+  set oldFileName [getTh1SetupFileName]
+  if {[file exists $oldFileName]} then {
+    set newFileName [getSavedTh1SetupFileName]
+    catch {file delete $newFileName}
+    file rename $oldFileName $newFileName
+  }
+}
+
+# Restores the original TH1 setup script file by renaming it back, based
+# on the current process ID.
+#
+proc restoreTh1SetupFile {} {
+  set oldFileName [getSavedTh1SetupFileName]
+  set newFileName [getTh1SetupFileName]
+  if {[file exists $oldFileName]} then {
+    catch {file delete $newFileName}
+    file rename $oldFileName $newFileName
+  } else {
+    #
+    # NOTE: There was no TH1 setup script file, delete the test one.
+    #
+    file delete $newFileName
+  }
+}
+
 # Perform a test
 #
+set test_count 0
 proc test {name expr} {
-  global bad_test
+  global bad_test test_count
+  incr test_count
   set r [uplevel 1 [list expr $expr]]
   if {$r} {
-    puts "test $name OK"
+    protOut "test $name OK"
   } else {
-    puts "test $name FAILED!"
+    protOut "test $name FAILED!"
     lappend bad_test $name
     if {$::HALT} exit
   }
@@ -169,8 +355,86 @@ proc random_changes {body blocksize count index prob} {
   return [string range $out 1 end]
 }
 
-foreach testfile $argv {
-  puts "***** $testfile ******"
-  source $testdir/$testfile.test
+# Executes the "fossil http" command.  The entire content of the HTTP request
+# is read from the data file name, with [subst] being performed on it prior to
+# submission.  Temporary input and output files are created and deleted.  The
+# result will be the contents of the temoprary output file.
+proc test_fossil_http { repository dataFileName url } {
+  set suffix [appendArgs [pid] - [getSeqNo] - [clock seconds] .txt]
+  set inFileName [file join $::tempPath [appendArgs test-http-in- $suffix]]
+  set outFileName [file join $::tempPath [appendArgs test-http-out- $suffix]]
+  set data [subst [read_file $dataFileName]]
+
+  write_file $inFileName $data
+  fossil http $inFileName $outFileName 127.0.0.1 $repository --localauth
+  set result [expr {[file exists $outFileName] ? [read_file $outFileName] : ""}]
+
+  if {1} then {
+    catch {file delete $inFileName}
+    catch {file delete $outFileName}
+  }
+
+  return $result
 }
-puts "[llength $bad_test] errors: $bad_test"
+
+# obtains and increments a "sequence number" for this test run.
+proc getSeqNo {} {
+  upvar #0 seqNo seqNo
+  if {![info exists seqNo]} {
+    set seqNo 0
+  }
+  return [incr seqNo]
+}
+
+# fixup the whitespace in the result to make it easier to compare.
+proc normalize_result {} {
+  return [string map [list \r\n \n] [string trim $::RESULT]]
+}
+
+# returns the first line of the normalized result.
+proc first_data_line {} {
+  return [lindex [split [normalize_result] \n] 0]
+}
+
+# returns the second line of the normalized result.
+proc second_data_line {} {
+  return [lindex [split [normalize_result] \n] 1]
+}
+
+# returns the third line of the normalized result.
+proc third_data_line {} {
+  return [lindex [split [normalize_result] \n] 2]
+}
+
+# returns the last line of the normalized result.
+proc last_data_line {} {
+  return [lindex [split [normalize_result] \n] end]
+}
+
+# returns the second to last line of the normalized result.
+proc next_to_last_data_line {} {
+  return [lindex [split [normalize_result] \n] end-1]
+}
+
+# returns the third to last line of the normalized result.
+proc third_to_last_data_line {} {
+  return [lindex [split [normalize_result] \n] end-2]
+}
+
+protInit $fossilexe
+foreach testfile $argv {
+  set dir [file root [file tail $testfile]]
+  file delete -force $dir
+  file mkdir $dir
+  set origwd [pwd]
+  cd $dir
+  protOut "***** $testfile ******"
+  source $testdir/$testfile.test
+  protOut "***** End of $testfile: [llength $bad_test] errors so far ******"
+  cd $origwd
+}
+set nErr [llength $bad_test]
+protOut "***** Final result: $nErr errors out of $test_count tests"
+if {$nErr>0} {
+  protOut "***** Failures: $bad_test"
+}

@@ -20,6 +20,14 @@
 #include "config.h"
 #include "xfer.h"
 
+#include <time.h>
+
+/*
+** Maximum number of HTTP redirects that any http_exchange() call will
+** follow before throwing a fatal error. Most browsers use a limit of 20.
+*/
+#define MAX_REDIRECTS 20
+
 /*
 ** This structure holds information about the current state of either
 ** a client or a server that is participating in xfer.
@@ -29,7 +37,7 @@ struct Xfer {
   Blob *pIn;          /* Input text from the other side */
   Blob *pOut;         /* Compose our reply here */
   Blob line;          /* The current line of input */
-  Blob aToken[5];     /* Tokenized version of line */
+  Blob aToken[6];     /* Tokenized version of line */
   Blob err;           /* Error message text */
   int nToken;         /* Number of tokens in line */
   int nIGotSent;      /* Number of "igot" cards sent */
@@ -39,7 +47,11 @@ struct Xfer {
   int nFileRcvd;      /* Number of files received */
   int nDeltaRcvd;     /* Number of deltas received */
   int nDanglingFile;  /* Number of dangling deltas received */
-  int mxSend;         /* Stop sending "file" with pOut reaches this size */
+  int mxSend;         /* Stop sending "file" when pOut reaches this size */
+  int resync;         /* Send igot cards for all holdings */
+  u8 syncPrivate;     /* True to enable syncing private content */
+  u8 nextIsPrivate;   /* If true, next "file" received is a private */
+  time_t maxTime;     /* Time when this transfer should be finished */
 };
 
 
@@ -51,7 +63,7 @@ struct Xfer {
 ** Compare to uuid_to_rid().  This routine takes a blob argument
 ** and does less error checking.
 */
-static int rid_from_uuid(Blob *pUuid, int phantomize){
+static int rid_from_uuid(Blob *pUuid, int phantomize, int isPrivate){
   static Stmt q;
   int rid;
 
@@ -64,7 +76,7 @@ static int rid_from_uuid(Blob *pUuid, int phantomize){
   }
   db_reset(&q);
   if( rid==0 && phantomize ){
-    rid = content_new(blob_str(pUuid));
+    rid = content_new(blob_str(pUuid), isPrivate);
   }
   return rid;
 }
@@ -74,11 +86,17 @@ static int rid_from_uuid(Blob *pUuid, int phantomize){
 ** of the file rid.
 */
 static void remote_has(int rid){
-  if( rid ) db_multi_exec("INSERT OR IGNORE INTO onremote VALUES(%d)", rid);
+  if( rid ){
+    static Stmt q;
+    db_static_prepare(&q, "INSERT OR IGNORE INTO onremote VALUES(:r)");
+    db_bind_int(&q, ":r", rid);
+    db_step(&q);
+    db_reset(&q);
+  }
 }
 
 /*
-** The aToken[0..nToken-1] blob array is a parse of a "file" line 
+** The aToken[0..nToken-1] blob array is a parse of a "file" line
 ** message.  This routine finishes parsing that message and does
 ** a record insert of the file.
 **
@@ -97,13 +115,21 @@ static void remote_has(int rid){
 ** Any artifact successfully received by this routine is considered to
 ** be public and is therefore removed from the "private" table.
 */
-static void xfer_accept_file(Xfer *pXfer){
+static void xfer_accept_file(
+  Xfer *pXfer,
+  int cloneFlag,
+  char **pzUuidList,
+  int *pnUuidList
+){
   int n;
   int rid;
   int srcid = 0;
   Blob content, hash;
-  
-  if( pXfer->nToken<3 
+  int isPriv;
+
+  isPriv = pXfer->nextIsPrivate;
+  pXfer->nextIsPrivate = 0;
+  if( pXfer->nToken<3
    || pXfer->nToken>4
    || !blob_is_uuid(&pXfer->aToken[1])
    || !blob_is_int(&pXfer->aToken[pXfer->nToken-1], &n)
@@ -116,18 +142,45 @@ static void xfer_accept_file(Xfer *pXfer){
   blob_zero(&content);
   blob_zero(&hash);
   blob_extract(pXfer->pIn, n, &content);
-  if( uuid_is_shunned(blob_str(&pXfer->aToken[1])) ){
+  if( !cloneFlag && uuid_is_shunned(blob_str(&pXfer->aToken[1])) ){
     /* Ignore files that have been shunned */
+    blob_reset(&content);
+    return;
+  }
+  if( isPriv && !g.perm.Private ){
+    /* Do not accept private files if not authorized */
+    blob_reset(&content);
+    return;
+  }
+  if( cloneFlag ){
+    if( pXfer->nToken==4 ){
+      srcid = rid_from_uuid(&pXfer->aToken[2], 1, isPriv);
+      pXfer->nDeltaRcvd++;
+    }else{
+      srcid = 0;
+      pXfer->nFileRcvd++;
+    }
+    rid = content_put_ex(&content, blob_str(&pXfer->aToken[1]), srcid,
+                         0, isPriv);
+    Th_AppendToList(pzUuidList, pnUuidList, blob_str(&pXfer->aToken[1]),
+                    blob_size(&pXfer->aToken[1]));
+    remote_has(rid);
+    blob_reset(&content);
     return;
   }
   if( pXfer->nToken==4 ){
     Blob src, next;
-    srcid = rid_from_uuid(&pXfer->aToken[2], 1);
+    srcid = rid_from_uuid(&pXfer->aToken[2], 1, isPriv);
     if( content_get(srcid, &src)==0 ){
-      rid = content_put(&content, blob_str(&pXfer->aToken[1]), srcid);
+      rid = content_put_ex(&content, blob_str(&pXfer->aToken[1]), srcid,
+                           0, isPriv);
+      Th_AppendToList(pzUuidList, pnUuidList, blob_str(&pXfer->aToken[1]),
+                      blob_size(&pXfer->aToken[1]));
       pXfer->nDanglingFile++;
       db_multi_exec("DELETE FROM phantom WHERE rid=%d", rid);
-      content_make_public(rid);
+      if( !isPriv ) content_make_public(rid);
+      blob_reset(&src);
+      blob_reset(&content);
       return;
     }
     pXfer->nDeltaRcvd++;
@@ -142,15 +195,92 @@ static void xfer_accept_file(Xfer *pXfer){
   if( !blob_eq_str(&pXfer->aToken[1], blob_str(&hash), -1) ){
     blob_appendf(&pXfer->err, "content does not match sha1 hash");
   }
-  rid = content_put(&content, blob_str(&hash), 0);
+  rid = content_put_ex(&content, blob_str(&hash), 0, 0, isPriv);
+  Th_AppendToList(pzUuidList, pnUuidList, blob_str(&hash), blob_size(&hash));
   blob_reset(&hash);
   if( rid==0 ){
     blob_appendf(&pXfer->err, "%s", g.zErrMsg);
+    blob_reset(&content);
   }else{
-    content_make_public(rid);
-    manifest_crosslink(rid, &content);
+    if( !isPriv ) content_make_public(rid);
+    manifest_crosslink(rid, &content, MC_NO_ERRORS);
   }
+  assert( blob_is_reset(&content) );
   remote_has(rid);
+}
+
+/*
+** The aToken[0..nToken-1] blob array is a parse of a "cfile" line
+** message.  This routine finishes parsing that message and does
+** a record insert of the file.  The difference between "file" and
+** "cfile" is that with "cfile" the content is already compressed.
+**
+** The file line is in one of the following two forms:
+**
+**      cfile UUID USIZE CSIZE \n CONTENT
+**      cfile UUID DELTASRC USIZE CSIZE \n CONTENT
+**
+** The content is CSIZE bytes immediately following the newline.
+** If DELTASRC exists, then the CONTENT is a delta against the
+** content of DELTASRC.
+**
+** The original size of the UUID artifact is USIZE.
+**
+** If any error occurs, write a message into pErr which has already
+** be initialized to an empty string.
+**
+** Any artifact successfully received by this routine is considered to
+** be public and is therefore removed from the "private" table.
+*/
+static void xfer_accept_compressed_file(
+  Xfer *pXfer,
+  char **pzUuidList,
+  int *pnUuidList
+){
+  int szC;   /* CSIZE */
+  int szU;   /* USIZE */
+  int rid;
+  int srcid = 0;
+  Blob content;
+  int isPriv;
+
+  isPriv = pXfer->nextIsPrivate;
+  pXfer->nextIsPrivate = 0;
+  if( pXfer->nToken<4
+   || pXfer->nToken>5
+   || !blob_is_uuid(&pXfer->aToken[1])
+   || !blob_is_int(&pXfer->aToken[pXfer->nToken-2], &szU)
+   || !blob_is_int(&pXfer->aToken[pXfer->nToken-1], &szC)
+   || szC<0 || szU<0
+   || (pXfer->nToken==5 && !blob_is_uuid(&pXfer->aToken[2]))
+  ){
+    blob_appendf(&pXfer->err, "malformed cfile line");
+    return;
+  }
+  if( isPriv && !g.perm.Private ){
+    /* Do not accept private files if not authorized */
+    return;
+  }
+  blob_zero(&content);
+  blob_extract(pXfer->pIn, szC, &content);
+  if( uuid_is_shunned(blob_str(&pXfer->aToken[1])) ){
+    /* Ignore files that have been shunned */
+    blob_reset(&content);
+    return;
+  }
+  if( pXfer->nToken==5 ){
+    srcid = rid_from_uuid(&pXfer->aToken[2], 1, isPriv);
+    pXfer->nDeltaRcvd++;
+  }else{
+    srcid = 0;
+    pXfer->nFileRcvd++;
+  }
+  rid = content_put_ex(&content, blob_str(&pXfer->aToken[1]), srcid,
+                       szC, isPriv);
+  Th_AppendToList(pzUuidList, pnUuidList, blob_str(&pXfer->aToken[1]),
+                  blob_size(&pXfer->aToken[1]));
+  remote_has(rid);
+  blob_reset(&content);
 }
 
 /*
@@ -164,21 +294,18 @@ static void xfer_accept_file(Xfer *pXfer){
 static int send_delta_parent(
   Xfer *pXfer,            /* The transfer context */
   int rid,                /* record id of the file to send */
+  int isPrivate,          /* True if rid is a private artifact */
   Blob *pContent,         /* The content of the file to send */
   Blob *pUuid             /* The UUID of the file to send */
 ){
-  static const char *azQuery[] = {
+  static const char *const azQuery[] = {
     "SELECT pid FROM plink x"
     " WHERE cid=%d"
-    "   AND NOT EXISTS(SELECT 1 FROM phantom WHERE rid=pid)"
-    "   AND NOT EXISTS(SELECT 1 FROM plink y"
-                      " WHERE y.pid=x.cid AND y.cid=x.pid)",
+    "   AND NOT EXISTS(SELECT 1 FROM phantom WHERE rid=pid)",
 
-    "SELECT pid FROM mlink x"
+    "SELECT pid, min(mtime) FROM mlink, event ON mlink.mid=event.objid"
     " WHERE fid=%d"
     "   AND NOT EXISTS(SELECT 1 FROM phantom WHERE rid=pid)"
-    "   AND NOT EXISTS(SELECT 1 FROM mlink y"
-                     "  WHERE y.pid=x.fid AND y.fid=x.pid)"
   };
   int i;
   Blob src, delta;
@@ -186,9 +313,12 @@ static int send_delta_parent(
   int srcId = 0;
 
   for(i=0; srcId==0 && i<count(azQuery); i++){
-    srcId = db_int(0, azQuery[i], rid);
+    srcId = db_int(0, azQuery[i] /*works-like:"%d"*/, rid);
   }
-  if( srcId>0 && !content_is_private(srcId) && content_get(srcId, &src) ){
+  if( srcId>0
+   && (pXfer->syncPrivate || !content_is_private(srcId))
+   && content_get(srcId, &src)
+  ){
     char *zUuid = db_text(0, "SELECT uuid FROM blob WHERE rid=%d", srcId);
     blob_delta_create(&src, pContent, &delta);
     size = blob_size(&delta);
@@ -197,9 +327,9 @@ static int send_delta_parent(
     }else if( uuid_is_shunned(zUuid) ){
       size = 0;
     }else{
+       if( isPrivate ) blob_append(pXfer->pOut, "private\n", -1);
       blob_appendf(pXfer->pOut, "file %b %s %d\n", pUuid, zUuid, size);
       blob_append(pXfer->pOut, blob_buffer(&delta), size);
-      /* blob_appendf(pXfer->pOut, "\n", 1); */
     }
     blob_reset(&delta);
     free(zUuid);
@@ -209,7 +339,7 @@ static int send_delta_parent(
 }
 
 /*
-** Try to send a file as a native delta.  
+** Try to send a file as a native delta.
 ** If successful, return the number of bytes in the delta.
 ** If we cannot generate an appropriate delta, then send
 ** nothing and return zero.
@@ -219,6 +349,7 @@ static int send_delta_parent(
 static int send_delta_native(
   Xfer *pXfer,            /* The transfer context */
   int rid,                /* record id of the file to send */
+  int isPrivate,          /* True if rid is a private artifact */
   Blob *pUuid             /* The UUID of the file to send */
 ){
   Blob src, delta;
@@ -226,7 +357,9 @@ static int send_delta_native(
   int srcId;
 
   srcId = db_int(0, "SELECT srcid FROM delta WHERE rid=%d", rid);
-  if( srcId>0 && !content_is_private(srcId) ){
+  if( srcId>0
+   && (pXfer->syncPrivate || !content_is_private(srcId))
+  ){
     blob_zero(&src);
     db_blob(&src, "SELECT uuid FROM blob WHERE rid=%d", srcId);
     if( uuid_is_shunned(blob_str(&src)) ){
@@ -236,6 +369,7 @@ static int send_delta_native(
     blob_zero(&delta);
     db_blob(&delta, "SELECT content FROM blob WHERE rid=%d", rid);
     blob_uncompress(&delta, &delta);
+    if( isPrivate ) blob_append(pXfer->pOut, "private\n", -1);
     blob_appendf(pXfer->pOut, "file %b %b %d\n",
                 pUuid, &src, blob_size(&delta));
     blob_append(pXfer->pOut, blob_buffer(&delta), blob_size(&delta));
@@ -264,8 +398,9 @@ static int send_delta_native(
 static void send_file(Xfer *pXfer, int rid, Blob *pUuid, int nativeDelta){
   Blob content, uuid;
   int size = 0;
+  int isPriv = content_is_private(rid);
 
-  if( content_is_private(rid) ) return;
+  if( pXfer->syncPrivate==0 && isPriv ) return;
   if( db_exists("SELECT 1 FROM onremote WHERE rid=%d", rid) ){
      return;
   }
@@ -286,14 +421,16 @@ static void send_file(Xfer *pXfer, int rid, Blob *pUuid, int nativeDelta){
     blob_reset(&uuid);
     return;
   }
-  if( pXfer->mxSend<=blob_size(pXfer->pOut) ){
-    blob_appendf(pXfer->pOut, "igot %b\n", pUuid);
+  if( (pXfer->maxTime != -1 && time(NULL) >= pXfer->maxTime) ||
+       pXfer->mxSend<=blob_size(pXfer->pOut) ){
+    const char *zFormat = isPriv ? "igot %b 1\n" : "igot %b\n";
+    blob_appendf(pXfer->pOut, zFormat /*works-like:"%b"*/, pUuid);
     pXfer->nIGotSent++;
     blob_reset(&uuid);
     return;
   }
   if( nativeDelta ){
-    size = send_delta_native(pXfer, rid, pUuid);
+    size = send_delta_native(pXfer, rid, isPriv, pUuid);
     if( size ){
       pXfer->nDeltaSent++;
     }
@@ -302,33 +439,105 @@ static void send_file(Xfer *pXfer, int rid, Blob *pUuid, int nativeDelta){
     content_get(rid, &content);
 
     if( !nativeDelta && blob_size(&content)>100 ){
-      size = send_delta_parent(pXfer, rid, &content, pUuid);
+      size = send_delta_parent(pXfer, rid, isPriv, &content, pUuid);
     }
     if( size==0 ){
       int size = blob_size(&content);
+      if( isPriv ) blob_append(pXfer->pOut, "private\n", -1);
       blob_appendf(pXfer->pOut, "file %b %d\n", pUuid, size);
       blob_append(pXfer->pOut, blob_buffer(&content), size);
       pXfer->nFileSent++;
     }else{
       pXfer->nDeltaSent++;
     }
+    blob_reset(&content);
   }
   remote_has(rid);
   blob_reset(&uuid);
+#if 0
+  if( blob_buffer(pXfer->pOut)[blob_size(pXfer->pOut)-1]!='\n' ){
+    blob_append(pXfer->pOut, "\n", 1);
+  }
+#endif
+}
+
+/*
+** Send the file identified by rid as a compressed artifact.  Basically,
+** send the content exactly as it appears in the BLOB table using
+** a "cfile" card.
+*/
+static void send_compressed_file(Xfer *pXfer, int rid){
+  const char *zContent;
+  const char *zUuid;
+  const char *zDelta;
+  int szU;
+  int szC;
+  int rc;
+  int isPrivate;
+  int srcIsPrivate;
+  static Stmt q1;
+  Blob fullContent;
+
+  isPrivate = content_is_private(rid);
+  if( isPrivate && pXfer->syncPrivate==0 ) return;
+  db_static_prepare(&q1,
+    "SELECT uuid, size, content, delta.srcid IN private,"
+         "  (SELECT uuid FROM blob WHERE rid=delta.srcid)"
+    " FROM blob LEFT JOIN delta ON (blob.rid=delta.rid)"
+    " WHERE blob.rid=:rid"
+    "   AND blob.size>=0"
+    "   AND NOT EXISTS(SELECT 1 FROM shun WHERE shun.uuid=blob.uuid)"
+  );
+  db_bind_int(&q1, ":rid", rid);
+  rc = db_step(&q1);
+  if( rc==SQLITE_ROW ){
+    zUuid = db_column_text(&q1, 0);
+    szU = db_column_int(&q1, 1);
+    szC = db_column_bytes(&q1, 2);
+    zContent = db_column_raw(&q1, 2);
+    srcIsPrivate = db_column_int(&q1, 3);
+    zDelta = db_column_text(&q1, 4);
+    if( isPrivate ) blob_append(pXfer->pOut, "private\n", -1);
+    blob_appendf(pXfer->pOut, "cfile %s ", zUuid);
+    if( !isPrivate && srcIsPrivate ){
+      content_get(rid, &fullContent);
+      szU = blob_size(&fullContent);
+      blob_compress(&fullContent, &fullContent);
+      szC = blob_size(&fullContent);
+      zContent = blob_buffer(&fullContent);
+      zDelta = 0;
+    }
+    if( zDelta ){
+      blob_appendf(pXfer->pOut, "%s ", zDelta);
+      pXfer->nDeltaSent++;
+    }else{
+      pXfer->nFileSent++;
+    }
+    blob_appendf(pXfer->pOut, "%d %d\n", szU, szC);
+    blob_append(pXfer->pOut, zContent, szC);
+    if( blob_buffer(pXfer->pOut)[blob_size(pXfer->pOut)-1]!='\n' ){
+      blob_append(pXfer->pOut, "\n", 1);
+    }
+    if( !isPrivate && srcIsPrivate ){
+      blob_reset(&fullContent);
+    }
+  }
+  db_reset(&q1);
 }
 
 /*
 ** Send a gimme message for every phantom.
 **
-** It should not be possible to have a private phantom.  But just to be
-** sure, take care not to send any "gimme" messagse on private artifacts.
+** Except: do not request shunned artifacts.  And do not request
+** private artifacts if we are not doing a private transfer.
 */
 static void request_phantoms(Xfer *pXfer, int maxReq){
   Stmt q;
-  db_prepare(&q, 
-    "SELECT uuid FROM phantom JOIN blob USING(rid)"
-    " WHERE NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid)"
-    "   AND NOT EXISTS(SELECT 1 FROM private WHERE rid=blob.rid)"
+  db_prepare(&q,
+    "SELECT uuid FROM phantom CROSS JOIN blob USING(rid) /*scan*/"
+    " WHERE NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid) %s",
+    (pXfer->syncPrivate ? "" :
+         "   AND NOT EXISTS(SELECT 1 FROM private WHERE rid=blob.rid)")
   );
   while( db_step(&q)==SQLITE_ROW && maxReq-- > 0 ){
     const char *zUuid = db_column_text(&q, 0);
@@ -360,11 +569,11 @@ static int check_tail_hash(Blob *pHash, Blob *pMsg){
 **
 **        login LOGIN NONCE SIGNATURE
 **
-** The NONCE is the SHA1 hash of the remainder of the input.  
-** SIGNATURE is the SHA1 checksum of the NONCE concatenated 
+** The NONCE is the SHA1 hash of the remainder of the input.
+** SIGNATURE is the SHA1 checksum of the NONCE concatenated
 ** with the users password.
 **
-** The parameters to this routine are ephermeral blobs holding the
+** The parameters to this routine are ephemeral blobs holding the
 ** LOGIN, NONCE and SIGNATURE.
 **
 ** This routine attempts to locate the user and verify the signature.
@@ -373,7 +582,7 @@ static int check_tail_hash(Blob *pHash, Blob *pMsg){
 **
 ** If anything fails to check out, no changes are made to privileges.
 **
-** Signature generation on the client side is handled by the 
+** Signature generation on the client side is handled by the
 ** http_exchange() routine.
 **
 ** Return non-zero for a login failure and zero for success.
@@ -384,8 +593,12 @@ int check_login(Blob *pLogin, Blob *pNonce, Blob *pSig){
   char *zLogin = blob_terminate(pLogin);
   defossilize(zLogin);
 
-  if( strcmp(zLogin, "nobody")==0 || strcmp(zLogin,"anonymous")==0 ){
+  if( fossil_strcmp(zLogin, "nobody")==0 || fossil_strcmp(zLogin,"anonymous")==0 ){
     return 0;   /* Anybody is allowed to sync as "nobody" or "anonymous" */
+  }
+  if( fossil_strcmp(P("REMOTE_USER"), zLogin)==0
+      && db_get_boolean("remote_user_ok",0) ){
+    return 0;   /* Accept Basic Authorization */
   }
   db_prepare(&q,
      "SELECT pw, cap, uid FROM user"
@@ -405,7 +618,7 @@ int check_login(Blob *pLogin, Blob *pNonce, Blob *pSig){
     blob_append(&combined, blob_buffer(&pw), szPw);
     sha1sum_blob(&combined, &hash);
     assert( blob_size(&hash)==40 );
-    rc = blob_compare(&hash, pSig);
+    rc = blob_constant_time_cmp(&hash, pSig);
     blob_reset(&hash);
     blob_reset(&combined);
     if( rc!=0 && szPw!=40 ){
@@ -414,34 +627,26 @@ int check_login(Blob *pLogin, Blob *pNonce, Blob *pSig){
       ** again with the SHA1 password.
       */
       const char *zPw = db_column_text(&q, 0);
-      char *zSecret = sha1_shared_secret(zPw, blob_str(pLogin));
+      char *zSecret = sha1_shared_secret(zPw, blob_str(pLogin), 0);
       blob_zero(&combined);
       blob_copy(&combined, pNonce);
       blob_append(&combined, zSecret, -1);
       free(zSecret);
       sha1sum_blob(&combined, &hash);
-      rc = blob_compare(&hash, pSig);
+      rc = blob_constant_time_cmp(&hash, pSig);
       blob_reset(&hash);
       blob_reset(&combined);
     }
     if( rc==0 ){
       const char *zCap;
       zCap = db_column_text(&q, 1);
-      login_set_capabilities(zCap);
+      login_set_capabilities(zCap, 0);
       g.userUid = db_column_int(&q, 2);
       g.zLogin = mprintf("%b", pLogin);
       g.zNonce = mprintf("%b", pNonce);
-      if( g.fHttpTrace ){
-        fprintf(stderr, "# login [%s] with capabilities [%s]\n", g.zLogin,zCap);
-      }
     }
   }
   db_finalize(&q);
-
-  if( rc==0 ){
-    /* If the login was successful. */
-    login_set_anon_nobody_capabilities();
-  }
   return rc;
 }
 
@@ -469,40 +674,82 @@ static void send_unsent(Xfer *pXfer){
 ** count toward the 100 total.  And phantoms are never added to a new
 ** cluster.
 */
-static void create_cluster(void){
+void create_cluster(void){
   Blob cluster, cksum;
+  Blob deleteWhere;
   Stmt q;
   int nUncl;
+  int nRow = 0;
+  int rid;
 
+#if 0
   /* We should not ever get any private artifacts in the unclustered table.
   ** But if we do (because of a bug) now is a good time to delete them. */
   db_multi_exec(
     "DELETE FROM unclustered WHERE rid IN (SELECT rid FROM private)"
   );
+#endif
 
   nUncl = db_int(0, "SELECT count(*) FROM unclustered /*scan*/"
                     " WHERE NOT EXISTS(SELECT 1 FROM phantom"
                                       " WHERE rid=unclustered.rid)");
-  if( nUncl<100 ){
-    return;
+  if( nUncl>=100 ){
+    blob_zero(&cluster);
+    blob_zero(&deleteWhere);
+    db_prepare(&q, "SELECT uuid FROM unclustered, blob"
+                   " WHERE NOT EXISTS(SELECT 1 FROM phantom"
+                   "                   WHERE rid=unclustered.rid)"
+                   "   AND unclustered.rid=blob.rid"
+                   "   AND NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid)"
+                   " ORDER BY 1");
+    while( db_step(&q)==SQLITE_ROW ){
+      blob_appendf(&cluster, "M %s\n", db_column_text(&q, 0));
+      nRow++;
+      if( nRow>=800 && nUncl>nRow+100 ){
+        md5sum_blob(&cluster, &cksum);
+        blob_appendf(&cluster, "Z %b\n", &cksum);
+        blob_reset(&cksum);
+        rid = content_put(&cluster);
+        manifest_crosslink(rid, &cluster, MC_NONE);
+        blob_reset(&cluster);
+        nUncl -= nRow;
+        nRow = 0;
+        blob_append_sql(&deleteWhere, ",%d", rid);
+      }
+    }
+    db_finalize(&q);
+    db_multi_exec(
+      "DELETE FROM unclustered WHERE rid NOT IN (0 %s)"
+      "   AND NOT EXISTS(SELECT 1 FROM phantom WHERE rid=unclustered.rid)",
+      blob_sql_text(&deleteWhere)
+    );
+    blob_reset(&deleteWhere);
+    if( nRow>0 ){
+      md5sum_blob(&cluster, &cksum);
+      blob_appendf(&cluster, "Z %b\n", &cksum);
+      blob_reset(&cksum);
+      rid = content_put(&cluster);
+      manifest_crosslink(rid, &cluster, MC_NONE);
+      blob_reset(&cluster);
+    }
   }
-  blob_zero(&cluster);
-  db_prepare(&q, "SELECT uuid FROM unclustered, blob"
-                 " WHERE NOT EXISTS(SELECT 1 FROM phantom"
-                 "                   WHERE rid=unclustered.rid)"
-                 "   AND unclustered.rid=blob.rid"
-                 "   AND NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid)"
-                 " ORDER BY 1");
-  while( db_step(&q)==SQLITE_ROW ){
-    blob_appendf(&cluster, "M %s\n", db_column_text(&q, 0));
+}
+
+/*
+** Send igot messages for every private artifact
+*/
+static int send_private(Xfer *pXfer){
+  int cnt = 0;
+  Stmt q;
+  if( pXfer->syncPrivate ){
+    db_prepare(&q, "SELECT uuid FROM private JOIN blob USING(rid)");
+    while( db_step(&q)==SQLITE_ROW ){
+      blob_appendf(pXfer->pOut, "igot %s 1\n", db_column_text(&q,0));
+      cnt++;
+    }
+    db_finalize(&q);
   }
-  db_finalize(&q);
-  md5sum_blob(&cluster, &cksum);
-  blob_appendf(&cluster, "Z %b\n", &cksum);
-  blob_reset(&cksum);
-  db_multi_exec("DELETE FROM unclustered");
-  content_put(&cluster, 0, 0);
-  blob_reset(&cluster);
+  return cnt;
 }
 
 /*
@@ -512,17 +759,33 @@ static void create_cluster(void){
 static int send_unclustered(Xfer *pXfer){
   Stmt q;
   int cnt = 0;
-  db_prepare(&q, 
-    "SELECT uuid FROM unclustered JOIN blob USING(rid)"
-    " WHERE NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid)"
-    "   AND NOT EXISTS(SELECT 1 FROM private WHERE rid=blob.rid)"
-    "   AND NOT EXISTS(SELECT 1 FROM phantom WHERE rid=blob.rid)"
-  );
+  if( pXfer->resync ){
+    db_prepare(&q,
+      "SELECT uuid, rid FROM blob"
+      " WHERE NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid)"
+      "   AND NOT EXISTS(SELECT 1 FROM phantom WHERE rid=blob.rid)"
+      "   AND NOT EXISTS(SELECT 1 FROM private WHERE rid=blob.rid)"
+      "   AND blob.rid<=%d"
+      " ORDER BY blob.rid DESC",
+      pXfer->resync
+    );
+  }else{
+    db_prepare(&q,
+      "SELECT uuid FROM unclustered JOIN blob USING(rid)"
+      " WHERE NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid)"
+      "   AND NOT EXISTS(SELECT 1 FROM phantom WHERE rid=blob.rid)"
+      "   AND NOT EXISTS(SELECT 1 FROM private WHERE rid=blob.rid)"
+    );
+  }
   while( db_step(&q)==SQLITE_ROW ){
     blob_appendf(pXfer->pOut, "igot %s\n", db_column_text(&q, 0));
     cnt++;
+    if( pXfer->resync && pXfer->mxSend<blob_size(pXfer->pOut) ){
+      pXfer->resync = db_column_int(&q, 1)-1;
+    }
   }
   db_finalize(&q);
+  if( cnt==0 ) pXfer->resync = 0;
   return cnt;
 }
 
@@ -531,7 +794,7 @@ static int send_unclustered(Xfer *pXfer){
 */
 static void send_all(Xfer *pXfer){
   Stmt q;
-  db_prepare(&q, 
+  db_prepare(&q,
     "SELECT uuid FROM blob "
     " WHERE NOT EXISTS(SELECT 1 FROM shun WHERE uuid=blob.uuid)"
     "   AND NOT EXISTS(SELECT 1 FROM private WHERE rid=blob.rid)"
@@ -544,9 +807,12 @@ static void send_all(Xfer *pXfer){
 }
 
 /*
-** Send a single config card for configuration item zName
+** Send a single old-style config card for configuration item zName.
+**
+** This routine and the functionality it implements is scheduled for
+** removal on 2012-05-01.
 */
-static void send_config_card(Xfer *pXfer, const char *zName){
+static void send_legacy_config_card(Xfer *pXfer, const char *zName){
   if( zName[0]!='@' ){
     Blob val;
     blob_zero(&val);
@@ -567,6 +833,76 @@ static void send_config_card(Xfer *pXfer, const char *zName){
   }
 }
 
+/*
+** Called when there is an attempt to transfer private content to and
+** from a server without authorization.
+*/
+static void server_private_xfer_not_authorized(void){
+  @ error not\sauthorized\sto\ssync\sprivate\scontent
+}
+
+/*
+** Return the common TH1 code to evaluate prior to evaluating any other
+** TH1 transfer notification scripts.
+*/
+const char *xfer_common_code(void){
+  return db_get("xfer-common-script", 0);
+}
+
+/*
+** Return the TH1 code to evaluate when a push is processed.
+*/
+const char *xfer_push_code(void){
+  return db_get("xfer-push-script", 0);
+}
+
+/*
+** Return the TH1 code to evaluate when a commit is processed.
+*/
+const char *xfer_commit_code(void){
+  return db_get("xfer-commit-script", 0);
+}
+
+/*
+** Return the TH1 code to evaluate when a ticket change is processed.
+*/
+const char *xfer_ticket_code(void){
+  return db_get("xfer-ticket-script", 0);
+}
+
+/*
+** Run the specified TH1 script, if any, and returns 1 on error.
+*/
+int xfer_run_script(
+  const char *zScript,
+  const char *zUuidOrList,
+  int bIsList
+){
+  int rc = TH_OK;
+  if( !zScript ) return rc;
+  Th_FossilInit(TH_INIT_DEFAULT);
+  Th_Store(bIsList ? "uuids" : "uuid", zUuidOrList ? zUuidOrList : "");
+  rc = Th_Eval(g.interp, 0, zScript, -1);
+  if( rc!=TH_OK ){
+    fossil_error(1, "%s", Th_GetResult(g.interp, 0));
+  }
+  return rc;
+}
+
+/*
+** Runs the pre-transfer TH1 script, if any, and returns its return code.
+** This script may be run multiple times.  If the script performs actions
+** that cannot be redone, it should use an internal [if] guard similar to
+** the following:
+**
+** if {![info exists common_done]} {
+**   # ... code here
+**   set common_done 1
+** }
+*/
+int xfer_run_common_script(void){
+  return xfer_run_script(xfer_common_code(), 0, 0);
+}
 
 /*
 ** If this variable is set, disable login checks.  Used for debugging
@@ -598,28 +934,55 @@ void page_xfer(void){
   int size;
   int recvConfig = 0;
   char *zNow;
+  int rc;
+  const char *zScript = 0;
+  char *zUuidList = 0;
+  int nUuidList = 0;
+  char **pzUuidList = 0;
+  int *pnUuidList = 0;
 
-  if( strcmp(PD("REQUEST_METHOD","POST"),"POST") ){
+  if( fossil_strcmp(PD("REQUEST_METHOD","POST"),"POST") ){
      fossil_redirect_home();
   }
+  g.zLogin = "anonymous";
+  login_set_anon_nobody_capabilities();
+  login_check_credentials();
   memset(&xfer, 0, sizeof(xfer));
   blobarray_zero(xfer.aToken, count(xfer.aToken));
   cgi_set_content_type(g.zContentType);
+  cgi_reset_content();
+  if( db_schema_is_outofdate() ){
+    @ error database\sschema\sis\sout-of-date\son\sthe\sserver.
+    return;
+  }
   blob_zero(&xfer.err);
   xfer.pIn = &g.cgiIn;
   xfer.pOut = cgi_output_blob();
   xfer.mxSend = db_get_int("max-download", 5000000);
+  xfer.maxTime = db_get_int("max-download-time", 30);
+  if( xfer.maxTime<1 ) xfer.maxTime = 1;
+  xfer.maxTime += time(NULL);
   g.xferPanic = 1;
 
   db_begin_transaction();
   db_multi_exec(
      "CREATE TEMP TABLE onremote(rid INTEGER PRIMARY KEY);"
   );
-  zNow = db_text(0, "SELECT strftime('%%Y-%%m-%%dT%%H:%%M:%%S', 'now')");
-  @ # timestamp %s(zNow)
   manifest_crosslink_begin();
+  rc = xfer_run_common_script();
+  if( rc==TH_ERROR ){
+    cgi_reset_content();
+    @ error common\sscript\sfailed:\s%F(g.zErrMsg)
+    nErr++;
+  }
+  zScript = xfer_push_code();
+  if( zScript ){ /* NOTE: Are TH1 transfer hooks enabled? */
+    pzUuidList = &zUuidList;
+    pnUuidList = &nUuidList;
+  }
   while( blob_line(xfer.pIn, &xfer.line) ){
     if( blob_buffer(&xfer.line)[0]=='#' ) continue;
+    if( blob_size(&xfer.line)==0 ) continue;
     xfer.nToken = blob_tokenize(&xfer.line, xfer.aToken, count(xfer.aToken));
 
     /*   file UUID SIZE \n CONTENT
@@ -634,7 +997,28 @@ void page_xfer(void){
         nErr++;
         break;
       }
-      xfer_accept_file(&xfer);
+      xfer_accept_file(&xfer, 0, pzUuidList, pnUuidList);
+      if( blob_size(&xfer.err) ){
+        cgi_reset_content();
+        @ error %T(blob_str(&xfer.err))
+        nErr++;
+        break;
+      }
+    }else
+
+    /*   cfile UUID USIZE CSIZE \n CONTENT
+    **   cfile UUID DELTASRC USIZE CSIZE \n CONTENT
+    **
+    ** Accept a file from the client.
+    */
+    if( blob_eq(&xfer.aToken[0], "cfile") ){
+      if( !isPush ){
+        cgi_reset_content();
+        @ error not\sauthorized\sto\swrite
+        nErr++;
+        break;
+      }
+      xfer_accept_compressed_file(&xfer, pzUuidList, pnUuidList);
       if( blob_size(&xfer.err) ){
         cgi_reset_content();
         @ error %T(blob_str(&xfer.err))
@@ -653,27 +1037,34 @@ void page_xfer(void){
     ){
       nGimme++;
       if( isPull ){
-        int rid = rid_from_uuid(&xfer.aToken[1], 0);
+        int rid = rid_from_uuid(&xfer.aToken[1], 0, 0);
         if( rid ){
           send_file(&xfer, rid, &xfer.aToken[1], deltaFlag);
         }
       }
     }else
 
-    /*   igot UUID
+    /*   igot UUID ?ISPRIVATE?
     **
-    ** Client announces that it has a particular file.
+    ** Client announces that it has a particular file.  If the ISPRIVATE
+    ** argument exists and is non-zero, then the file is a private file.
     */
-    if( xfer.nToken==2
+    if( xfer.nToken>=2
      && blob_eq(&xfer.aToken[0], "igot")
      && blob_is_uuid(&xfer.aToken[1])
     ){
       if( isPush ){
-        rid_from_uuid(&xfer.aToken[1], 1);
+        if( xfer.nToken==2 || blob_eq(&xfer.aToken[2],"1")==0 ){
+          rid_from_uuid(&xfer.aToken[1], 1, 0);
+        }else if( g.perm.Private ){
+          rid_from_uuid(&xfer.aToken[1], 1, 1);
+        }else{
+          server_private_xfer_not_authorized();
+        }
       }
     }else
-  
-    
+
+
     /*    pull  SERVERCODE  PROJECTCODE
     **    push  SERVERCODE  PROJECTCODE
     **
@@ -698,7 +1089,7 @@ void page_xfer(void){
       }
       login_check_credentials();
       if( blob_eq(&xfer.aToken[0], "pull") ){
-        if( !g.okRead ){
+        if( !g.perm.Read ){
           cgi_reset_content();
           @ error not\sauthorized\sto\sread
           nErr++;
@@ -706,7 +1097,7 @@ void page_xfer(void){
         }
         isPull = 1;
       }else{
-        if( !g.okWrite ){
+        if( !g.perm.Write ){
           if( !isPull ){
             cgi_reset_content();
             @ error not\sauthorized\sto\swrite
@@ -720,22 +1111,46 @@ void page_xfer(void){
       }
     }else
 
-    /*    clone
+    /*    clone   ?PROTOCOL-VERSION?  ?SEQUENCE-NUMBER?
     **
     ** The client knows nothing.  Tell all.
     */
     if( blob_eq(&xfer.aToken[0], "clone") ){
+      int iVers;
       login_check_credentials();
-      if( !g.okClone ){
+      if( !g.perm.Clone ){
         cgi_reset_content();
         @ push %s(db_get("server-code", "x")) %s(db_get("project-code", "x"))
         @ error not\sauthorized\sto\sclone
         nErr++;
         break;
       }
-      isClone = 1;
-      isPull = 1;
-      deltaFlag = 1;
+      if( xfer.nToken==3
+       && blob_is_int(&xfer.aToken[1], &iVers)
+       && iVers>=2
+      ){
+        int seqno, max;
+        if( iVers>=3 ){
+          cgi_set_content_type("application/x-fossil-uncompressed");
+        }
+        blob_is_int(&xfer.aToken[2], &seqno);
+        max = db_int(0, "SELECT max(rid) FROM blob");
+        while( xfer.mxSend>blob_size(xfer.pOut) && seqno<=max){
+          if( time(NULL) >= xfer.maxTime ) break;
+          if( iVers>=3 ){
+            send_compressed_file(&xfer, seqno);
+          }else{
+            send_file(&xfer, seqno, 0, 1);
+          }
+          seqno++;
+        }
+        if( seqno>max ) seqno = 0;
+        @ clone_seqno %d(seqno)
+      }else{
+        isClone = 1;
+        isPull = 1;
+        deltaFlag = 1;
+      }
       @ push %s(db_get("server-code", "x")) %s(db_get("project-code", "x"))
     }else
 
@@ -748,7 +1163,7 @@ void page_xfer(void){
      && xfer.nToken==4
     ){
       if( disableLogin ){
-        g.okRead = g.okWrite = 1;
+        g.perm.Read = g.perm.Write = g.perm.Private = g.perm.Admin = 1;
       }else{
         if( check_tail_hash(&xfer.aToken[2], xfer.pIn)
          || check_login(&xfer.aToken[1], &xfer.aToken[2], &xfer.aToken[3])
@@ -757,10 +1172,10 @@ void page_xfer(void){
           @ error login\sfailed
           nErr++;
           break;
-        }        
+        }
       }
     }else
-    
+
     /*    reqconfig  NAME
     **
     ** Request a configuration value
@@ -768,14 +1183,21 @@ void page_xfer(void){
     if( blob_eq(&xfer.aToken[0], "reqconfig")
      && xfer.nToken==2
     ){
-      if( g.okRead ){
+      if( g.perm.Read ){
         char *zName = blob_str(&xfer.aToken[1]);
-        if( configure_is_exportable(zName) ){
-          send_config_card(&xfer, zName);
+        if( zName[0]=='/' ){
+          /* New style configuration transfer */
+          int groupMask = configure_name_to_mask(&zName[1], 0);
+          if( !g.perm.Admin ) groupMask &= ~CONFIGSET_USER;
+          if( !g.perm.RdAddr ) groupMask &= ~CONFIGSET_ADDR;
+          configure_send_group(xfer.pOut, groupMask, 0);
+        }else if( configure_is_exportable(zName) ){
+          /* Old style configuration transfer */
+          send_legacy_config_card(&xfer, zName);
         }
       }
     }else
-    
+
     /*   config NAME SIZE \n CONTENT
     **
     ** Receive a configuration value from the client.  This is only
@@ -787,45 +1209,22 @@ void page_xfer(void){
       Blob content;
       blob_zero(&content);
       blob_extract(xfer.pIn, size, &content);
-      if( !g.okAdmin ){
+      if( !g.perm.Admin ){
         cgi_reset_content();
         @ error not\sauthorized\sto\spush\sconfiguration
         nErr++;
         break;
       }
-      if( zName[0]!='@' ){
-        if( strcmp(zName, "logo-image")==0 ){
-          Stmt ins;
-          db_prepare(&ins,
-            "REPLACE INTO config(name, value) VALUES(:name, :value)"
-          );
-          db_bind_text(&ins, ":name", zName);
-          db_bind_blob(&ins, ":value", &content);
-          db_step(&ins);
-          db_finalize(&ins);
-        }else{
-          db_multi_exec(
-              "REPLACE INTO config(name,value) VALUES(%Q,%Q)",
-              zName, blob_str(&content)
-          );
-        }
-      }else{
-        /* Notice that we are evaluating arbitrary SQL received from the
-        ** client.  But this can only happen if the client has authenticated
-        ** as an administrator, so presumably we trust the client at this
-        ** point.
-        */
-        if( !recvConfig ){
-          configure_prepare_to_receive(0);
-          recvConfig = 1;
-        }
-        db_multi_exec("%s", blob_str(&content));
+      if( !recvConfig && zName[0]=='@' ){
+        configure_prepare_to_receive(0);
+        recvConfig = 1;
       }
+      configure_receive(zName, &content, CONFIGSET_ALL);
       blob_reset(&content);
       blob_seek(xfer.pIn, 1, BLOB_SEEK_CUR);
     }else
 
-      
+
 
     /*    cookie TEXT
     **
@@ -848,6 +1247,51 @@ void page_xfer(void){
       /* Process the cookie */
     }else
 
+
+    /*    private
+    **
+    ** This card indicates that the next "file" or "cfile" will contain
+    ** private content.
+    */
+    if( blob_eq(&xfer.aToken[0], "private") ){
+      if( !g.perm.Private ){
+        server_private_xfer_not_authorized();
+      }else{
+        xfer.nextIsPrivate = 1;
+      }
+    }else
+
+
+    /*    pragma NAME VALUE...
+    **
+    ** The client issue pragmas to try to influence the behavior of the
+    ** server.  These are requests only.  Unknown pragmas are silently
+    ** ignored.
+    */
+    if( blob_eq(&xfer.aToken[0], "pragma") && xfer.nToken>=2 ){
+      /*   pragma send-private
+      **
+      ** If the user has the "x" privilege (which must be set explicitly -
+      ** it is not automatic with "a" or "s") then this pragma causes
+      ** private information to be pulled in addition to public records.
+      */
+      if( blob_eq(&xfer.aToken[1], "send-private") ){
+        login_check_credentials();
+        if( !g.perm.Private ){
+          server_private_xfer_not_authorized();
+        }else{
+          xfer.syncPrivate = 1;
+        }
+      }
+      /*   pragma send-catalog
+      **
+      ** Send igot cards for all known artifacts.
+      */
+      if( blob_eq(&xfer.aToken[1], "send-catalog") ){
+        xfer.resync = 0x7fffffff;
+      }
+    }else
+
     /* Unknown message
     */
     {
@@ -855,28 +1299,52 @@ void page_xfer(void){
       @ error bad\scommand:\s%F(blob_str(&xfer.line))
     }
     blobarray_reset(xfer.aToken, xfer.nToken);
+    blob_reset(&xfer.line);
   }
   if( isPush ){
+    if( rc==TH_OK ){
+      rc = xfer_run_script(zScript, zUuidList, 1);
+      if( rc==TH_ERROR ){
+        cgi_reset_content();
+        @ error push\sscript\sfailed:\s%F(g.zErrMsg)
+        nErr++;
+      }
+    }
     request_phantoms(&xfer, 500);
+  }
+  if( zUuidList ){
+    Th_Free(g.interp, zUuidList);
   }
   if( isClone && nGimme==0 ){
     /* The initial "clone" message from client to server contains no
     ** "gimme" cards. On that initial message, send the client an "igot"
-    ** card for every artifact currently in the respository.  This will
+    ** card for every artifact currently in the repository.  This will
     ** cause the client to create phantoms for all artifacts, which will
     ** in turn make sure that the entire repository is sent efficiently
     ** and expeditiously.
     */
     send_all(&xfer);
+    if( xfer.syncPrivate ) send_private(&xfer);
   }else if( isPull ){
     create_cluster();
     send_unclustered(&xfer);
+    if( xfer.syncPrivate ) send_private(&xfer);
   }
   if( recvConfig ){
     configure_finalize_receive();
   }
-  manifest_crosslink_end();
+  db_multi_exec("DROP TABLE onremote");
+  manifest_crosslink_end(MC_PERMIT_HOOKS);
+
+  /* Send the server timestamp last, in case prior processing happened
+  ** to use up a significant fraction of our time window.
+  */
+  zNow = db_text(0, "SELECT strftime('%%Y-%%m-%%dT%%H:%%M:%%S', 'now')");
+  @ # timestamp %s(zNow)
+  free(zNow);
+
   db_end_transaction(0);
+  configure_rebuild();
 }
 
 /*
@@ -900,16 +1368,15 @@ void page_xfer(void){
 **     r test-xfer out.txt
 */
 void cmd_test_xfer(void){
-  int notUsed;
+  db_find_and_open_repository(0,0);
   if( g.argc!=2 && g.argc!=3 ){
     usage("?MESSAGEFILE?");
   }
-  db_must_be_within_tree();
   blob_zero(&g.cgiIn);
   blob_read_from_file(&g.cgiIn, g.argc==2 ? "-" : g.argv[2]);
   disableLogin = 1;
   page_xfer();
-  printf("%s\n", cgi_extract_content(&notUsed));
+  fossil_print("%s\n", cgi_extract_content());
 }
 
 /*
@@ -917,43 +1384,70 @@ void cmd_test_xfer(void){
 */
 static const char zLabelFormat[] = "%-10s %10s %10s %10s %10s\n";
 static const char zValueFormat[] = "\r%-10s %10d %10d %10d %10d\n";
+static const char zBriefFormat[] =
+   "Round-trips: %d   Artifacts sent: %d  received: %d\r";
 
+#if INTERFACE
+/*
+** Flag options for controlling client_sync()
+*/
+#define SYNC_PUSH      0x0001
+#define SYNC_PULL      0x0002
+#define SYNC_CLONE     0x0004
+#define SYNC_PRIVATE   0x0008
+#define SYNC_VERBOSE   0x0010
+#define SYNC_RESYNC    0x0020
+#endif
 
 /*
-** Sync to the host identified in g.urlName and g.urlPath.  This
+** Floating-point absolute value
+*/
+static double fossil_fabs(double x){
+  return x>0.0 ? x : -x;
+}
+
+/*
+** Sync to the host identified in g.url.name and g.url.path.  This
 ** routine is called by the client.
 **
 ** Records are pushed to the server if pushFlag is true.  Records
 ** are pulled if pullFlag is true.  A full sync occurs if both are
 ** true.
 */
-void client_sync(
-  int pushFlag,           /* True to do a push (or a sync) */
-  int pullFlag,           /* True to do a pull (or a sync) */
-  int cloneFlag,          /* True if this is a clone */
-  int configRcvMask,      /* Receive these configuration items */
-  int configSendMask      /* Send these configuration items */
+int client_sync(
+  unsigned syncFlags,     /* Mask of SYNC_* flags */
+  unsigned configRcvMask, /* Receive these configuration items */
+  unsigned configSendMask /* Send these configuration items */
 ){
   int go = 1;             /* Loop until zero */
   int nCardSent = 0;      /* Number of cards sent */
   int nCardRcvd = 0;      /* Number of cards received */
   int nCycle = 0;         /* Number of round trips to the server */
   int size;               /* Size of a config value */
-  int nFileSend = 0;
   int origConfigRcvMask;  /* Original value of configRcvMask */
   int nFileRecv;          /* Number of files received */
   int mxPhantomReq = 200; /* Max number of phantoms to request per comm */
   const char *zCookie;    /* Server cookie */
-  int nSent, nRcvd;       /* Bytes sent and received (after compression) */
+  i64 nSent, nRcvd;       /* Bytes sent and received (after compression) */
+  int cloneSeqno = 1;     /* Sequence number for clones */
   Blob send;              /* Text we are sending to the server */
   Blob recv;              /* Reply we got back from the server */
   Xfer xfer;              /* Transfer data */
+  int pctDone;            /* Percentage done with a message */
+  int lastPctDone = -1;   /* Last displayed pctDone */
+  double rArrivalTime;    /* Time at which a message arrived */
   const char *zSCode = db_get("server-code", "x");
   const char *zPCode = db_get("project-code", 0);
+  int nErr = 0;           /* Number of errors */
+  int nRoundtrip= 0;      /* Number of HTTP requests */
+  int nArtifactSent = 0;  /* Total artifacts sent */
+  int nArtifactRcvd = 0;  /* Total artifacts received */
+  const char *zOpType = 0;/* Push, Pull, Sync, Clone */
+  double rSkew = 0.0;     /* Maximum time skew */
 
-  if( db_get_boolean("dont-push", 0) ) pushFlag = 0;
-  if( pushFlag + pullFlag + cloneFlag == 0 
-     && configRcvMask==0 && configSendMask==0 ) return;
+  if( db_get_boolean("dont-push", 0) ) syncFlags &= ~SYNC_PUSH;
+  if( (syncFlags & (SYNC_PUSH|SYNC_PULL|SYNC_CLONE))==0
+     && configRcvMask==0 && configSendMask==0 ) return 0;
 
   transport_stats(0, 0, 1);
   socket_global_init();
@@ -961,13 +1455,12 @@ void client_sync(
   xfer.pIn = &recv;
   xfer.pOut = &send;
   xfer.mxSend = db_get_int("max-upload", 250000);
+  xfer.maxTime = -1;
+  if( syncFlags & SYNC_PRIVATE ){
+    g.perm.Private = 1;
+    xfer.syncPrivate = 1;
+  }
 
-  assert( pushFlag | pullFlag | cloneFlag | configRcvMask | configSendMask );
-  db_begin_transaction();
-  db_record_repository_filename(0);
-  db_multi_exec(
-    "CREATE TEMP TABLE onremote(rid INTEGER PRIMARY KEY);"
-  );
   blobarray_zero(xfer.aToken, count(xfer.aToken));
   blob_zero(&send);
   blob_zero(&recv);
@@ -975,30 +1468,51 @@ void client_sync(
   blob_zero(&xfer.line);
   origConfigRcvMask = 0;
 
+
+  /* Send the send-private pragma if we are trying to sync private data */
+  if( syncFlags & SYNC_PRIVATE ){
+    blob_append(&send, "pragma send-private\n", -1);
+  }
+
   /*
   ** Always begin with a clone, pull, or push message
   */
-  if( cloneFlag ){
-    blob_appendf(&send, "clone\n");
-    pushFlag = 0;
-    pullFlag = 0;
+  if( syncFlags & SYNC_CLONE ){
+    blob_appendf(&send, "clone 3 %d\n", cloneSeqno);
+    syncFlags &= ~(SYNC_PUSH|SYNC_PULL);
     nCardSent++;
     /* TBD: Request all transferable configuration values */
-  }else if( pullFlag ){
+    content_enable_dephantomize(0);
+    zOpType = "Clone";
+  }else if( syncFlags & SYNC_PULL ){
     blob_appendf(&send, "pull %s %s\n", zSCode, zPCode);
     nCardSent++;
+    zOpType = (syncFlags & SYNC_PUSH)?"Sync":"Pull";
+    if( (syncFlags & SYNC_RESYNC)!=0 && nCycle<2 ){
+      blob_appendf(&send, "pragma send-catalog\n");
+      nCardSent++;
+    }
   }
-  if( pushFlag ){
+  if( syncFlags & SYNC_PUSH ){
     blob_appendf(&send, "push %s %s\n", zSCode, zPCode);
     nCardSent++;
+    if( (syncFlags & SYNC_PULL)==0 ) zOpType = "Push";
+    if( (syncFlags & SYNC_RESYNC)!=0 ) xfer.resync = 0x7fffffff;
   }
-  manifest_crosslink_begin();
-  transport_global_startup();
-  fossil_print(zLabelFormat, "", "Bytes", "Cards", "Artifacts", "Deltas");
+  if( syncFlags & SYNC_VERBOSE ){
+    fossil_print(zLabelFormat /*works-like:"%s%s%s%s%d"*/,
+                 "", "Bytes", "Cards", "Artifacts", "Deltas");
+  }
 
   while( go ){
     int newPhantom = 0;
     char *zRandomness;
+    db_begin_transaction();
+    db_record_repository_filename(0);
+    db_multi_exec(
+      "CREATE TEMP TABLE onremote(rid INTEGER PRIMARY KEY);"
+    );
+    manifest_crosslink_begin();
 
     /* Send make the most recently received cookie.  Let the server
     ** figure out if this is a cookie that it cares about.
@@ -1007,32 +1521,39 @@ void client_sync(
     if( zCookie ){
       blob_appendf(&send, "cookie %s\n", zCookie);
     }
-    
+
     /* Generate gimme cards for phantoms and leaf cards
     ** for all leaves.
     */
-    if( pullFlag || cloneFlag ){
+    if( (syncFlags & SYNC_PULL)!=0
+     || ((syncFlags & SYNC_CLONE)!=0 && cloneSeqno==1)
+    ){
       request_phantoms(&xfer, mxPhantomReq);
     }
-    if( pushFlag ){
+    if( syncFlags & SYNC_PUSH ){
       send_unsent(&xfer);
       nCardSent += send_unclustered(&xfer);
+      if( syncFlags & SYNC_PRIVATE ) send_private(&xfer);
     }
 
     /* Send configuration parameter requests.  On a clone, delay sending
-    ** this until the second cycle since the login card might fail on 
+    ** this until the second cycle since the login card might fail on
     ** the first cycle.
     */
-    if( configRcvMask && (cloneFlag==0 || nCycle>0) ){
+    if( configRcvMask && ((syncFlags & SYNC_CLONE)==0 || nCycle>0) ){
       const char *zName;
+      if( zOpType==0 ) zOpType = "Pull";
       zName = configure_first_name(configRcvMask);
       while( zName ){
         blob_appendf(&send, "reqconfig %s\n", zName);
         zName = configure_next_name(configRcvMask);
         nCardSent++;
       }
-      if( configRcvMask & (CONFIGSET_USER|CONFIGSET_TKT) ){
-        configure_prepare_to_receive(0);
+      if( (configRcvMask & (CONFIGSET_USER|CONFIGSET_TKT))!=0
+       && (configRcvMask & CONFIGSET_OLDFORMAT)!=0
+      ){
+        int overwrite = (configRcvMask & CONFIGSET_OVERWRITE)!=0;
+        configure_prepare_to_receive(overwrite);
       }
       origConfigRcvMask = configRcvMask;
       configRcvMask = 0;
@@ -1040,12 +1561,17 @@ void client_sync(
 
     /* Send configuration parameters being pushed */
     if( configSendMask ){
-      const char *zName;
-      zName = configure_first_name(configSendMask);
-      while( zName ){
-        send_config_card(&xfer, zName);
-        zName = configure_next_name(configSendMask);
-        nCardSent++;
+      if( zOpType==0 ) zOpType = "Push";
+      if( configSendMask & CONFIGSET_OLDFORMAT ){
+        const char *zName;
+        zName = configure_first_name(configSendMask);
+        while( zName ){
+          send_legacy_config_card(&xfer, zName);
+          zName = configure_next_name(configSendMask);
+          nCardSent++;
+        }
+      }else{
+        nCardSent += configure_send_group(xfer.pOut, configSendMask, 0);
       }
       configSendMask = 0;
     }
@@ -1058,29 +1584,53 @@ void client_sync(
     blob_appendf(&send, "# %s\n", zRandomness);
     free(zRandomness);
 
+    if( syncFlags & SYNC_VERBOSE ){
+      fossil_print("waiting for server...");
+    }
+    fflush(stdout);
     /* Exchange messages with the server */
-    nFileSend = xfer.nFileSent + xfer.nDeltaSent;
-    fossil_print(zValueFormat, "Send:",
-                 blob_size(&send), nCardSent+xfer.nGimmeSent+xfer.nIGotSent,
-                 xfer.nFileSent, xfer.nDeltaSent);
+    if( http_exchange(&send, &recv, (syncFlags & SYNC_CLONE)==0 || nCycle>0,
+        MAX_REDIRECTS) ){
+      nErr++;
+      go = 2;
+      break;
+    }
+
+    /* Output current stats */
+    if( syncFlags & SYNC_VERBOSE ){
+      fossil_print(zValueFormat /*works-like:"%s%d%d%d%d"*/, "Sent:",
+                   blob_size(&send), nCardSent+xfer.nGimmeSent+xfer.nIGotSent,
+                   xfer.nFileSent, xfer.nDeltaSent);
+    }else{
+      nRoundtrip++;
+      nArtifactSent += xfer.nFileSent + xfer.nDeltaSent;
+      fossil_print(zBriefFormat /*works-like:"%d%d%d"*/,
+                   nRoundtrip, nArtifactSent, nArtifactRcvd);
+    }
     nCardSent = 0;
     nCardRcvd = 0;
     xfer.nFileSent = 0;
     xfer.nDeltaSent = 0;
     xfer.nGimmeSent = 0;
     xfer.nIGotSent = 0;
-    fflush(stdout);
-    http_exchange(&send, &recv, cloneFlag==0 || nCycle>0);
+
+    lastPctDone = -1;
     blob_reset(&send);
+    rArrivalTime = db_double(0.0, "SELECT julianday('now')");
+
+    /* Send the send-private pragma if we are trying to sync private data */
+    if( syncFlags & SYNC_PRIVATE ){
+      blob_append(&send, "pragma send-private\n", -1);
+    }
 
     /* Begin constructing the next message (which might never be
     ** sent) by beginning with the pull or push cards
     */
-    if( pullFlag ){
+    if( syncFlags & SYNC_PULL ){
       blob_appendf(&send, "pull %s %s\n", zSCode, zPCode);
       nCardSent++;
     }
-    if( pushFlag ){
+    if( syncFlags & SYNC_PUSH ){
       blob_appendf(&send, "push %s %s\n", zSCode, zPCode);
       nCardSent++;
     }
@@ -1094,23 +1644,24 @@ void client_sync(
           char zTime[20];
           double rDiff;
           sqlite3_snprintf(sizeof(zTime), zTime, "%.19s", &zLine[12]);
-          rDiff = db_double(9e99, "SELECT julianday('%q') - julianday('now')",
-                            zTime);
-          if( rDiff<0.0 ) rDiff = -rDiff;
-          if( rDiff>9e98 ) rDiff = 0.0;
-          if( (rDiff*24.0*3600.0)>=60.0 ){
-            fossil_warning("*** time skew *** server time differs by %s",
-                           db_timespan_name(rDiff));
-            g.clockSkewSeen = 1;
-          }
+          rDiff = db_double(9e99, "SELECT julianday('%q') - %.17g",
+                            zTime, rArrivalTime);
+          if( rDiff>9e98 || rDiff<-9e98 ) rDiff = 0.0;
+          if( rDiff*24.0*3600.0 >= -(blob_size(&recv)/5000.0 + 20) ) rDiff = 0.0;
+          if( fossil_fabs(rDiff)>fossil_fabs(rSkew) ) rSkew = rDiff;
         }
+        nCardRcvd++;
         continue;
       }
       xfer.nToken = blob_tokenize(&xfer.line, xfer.aToken, count(xfer.aToken));
       nCardRcvd++;
-      if( !g.cgiOutput && !g.fQuiet ){
-        printf("\r%d", nCardRcvd);
-        fflush(stdout);
+      if( (syncFlags & SYNC_VERBOSE)!=0 && recv.nUsed>0 ){
+        pctDone = (recv.iCursor*100)/recv.nUsed;
+        if( pctDone!=lastPctDone ){
+          fossil_print("\rprocessed: %d%%         ", pctDone);
+          lastPctDone = pctDone;
+          fflush(stdout);
+        }
       }
 
       /*   file UUID SIZE \n CONTENT
@@ -1119,7 +1670,18 @@ void client_sync(
       ** Receive a file transmitted from the server.
       */
       if( blob_eq(&xfer.aToken[0],"file") ){
-        xfer_accept_file(&xfer);
+        xfer_accept_file(&xfer, (syncFlags & SYNC_CLONE)!=0, 0, 0);
+        nArtifactRcvd++;
+      }else
+
+      /*   cfile UUID USIZE CSIZE \n CONTENT
+      **   cfile UUID DELTASRC USIZE CSIZE \n CONTENT
+      **
+      ** Receive a compressed file transmitted from the server.
+      */
+      if( blob_eq(&xfer.aToken[0],"cfile") ){
+        xfer_accept_compressed_file(&xfer, 0, 0);
+        nArtifactRcvd++;
       }else
 
       /*   gimme UUID
@@ -1132,35 +1694,43 @@ void client_sync(
        && xfer.nToken==2
        && blob_is_uuid(&xfer.aToken[1])
       ){
-        if( pushFlag ){
-          int rid = rid_from_uuid(&xfer.aToken[1], 0);
+        if( syncFlags & SYNC_PUSH ){
+          int rid = rid_from_uuid(&xfer.aToken[1], 0, 0);
           if( rid ) send_file(&xfer, rid, &xfer.aToken[1], 0);
         }
       }else
-  
-      /*   igot UUID
+
+      /*   igot UUID  ?PRIVATEFLAG?
       **
       ** Server announces that it has a particular file.  If this is
       ** not a file that we have and we are pulling, then create a
       ** phantom to cause this file to be requested on the next cycle.
       ** Always remember that the server has this file so that we do
       ** not transmit it by accident.
+      **
+      ** If the PRIVATE argument exists and is 1, then the file is
+      ** private.  Pretend it does not exists if we are not pulling
+      ** private files.
       */
-      if( xfer.nToken==2
+      if( xfer.nToken>=2
        && blob_eq(&xfer.aToken[0], "igot")
        && blob_is_uuid(&xfer.aToken[1])
       ){
-        int rid = rid_from_uuid(&xfer.aToken[1], 0);
+        int rid;
+        int isPriv = xfer.nToken>=3 && blob_eq(&xfer.aToken[2],"1");
+        rid = rid_from_uuid(&xfer.aToken[1], 0, 0);
         if( rid>0 ){
-          content_make_public(rid);
-        }else if( pullFlag || cloneFlag ){
-          rid = content_new(blob_str(&xfer.aToken[1]));
+          if( !isPriv ) content_make_public(rid);
+        }else if( isPriv && !g.perm.Private ){
+          /* ignore private files */
+        }else if( (syncFlags & (SYNC_PULL|SYNC_CLONE))!=0 ){
+          rid = content_new(blob_str(&xfer.aToken[1]), isPriv);
           if( rid ) newPhantom = 1;
         }
         remote_has(rid);
       }else
-    
-      
+
+
       /*   push  SERVERCODE  PRODUCTCODE
       **
       ** Should only happen in response to a clone.  This message tells
@@ -1168,24 +1738,23 @@ void client_sync(
       */
       if( blob_eq(&xfer.aToken[0],"push")
        && xfer.nToken==3
-       && cloneFlag
-       && blob_is_uuid(&xfer.aToken[1])
+       && (syncFlags & SYNC_CLONE)!=0
        && blob_is_uuid(&xfer.aToken[2])
       ){
-        if( blob_eq_str(&xfer.aToken[1], zSCode, -1) ){
-          fossil_fatal("server loop");
-        }
         if( zPCode==0 ){
           zPCode = mprintf("%b", &xfer.aToken[2]);
           db_set("project-code", zPCode, 0);
         }
-        blob_appendf(&send, "clone\n");
+        if( cloneSeqno>0 ) blob_appendf(&send, "clone 3 %d\n", cloneSeqno);
         nCardSent++;
       }else
-      
+
       /*   config NAME SIZE \n CONTENT
       **
       ** Receive a configuration value from the server.
+      **
+      ** The received configuration setting is silently ignored if it was
+      ** not requested by a prior "reqconfig" sent from client to server.
       */
       if( blob_eq(&xfer.aToken[0],"config") && xfer.nToken==3
           && blob_is_int(&xfer.aToken[2], &size) ){
@@ -1193,39 +1762,15 @@ void client_sync(
         Blob content;
         blob_zero(&content);
         blob_extract(xfer.pIn, size, &content);
-        g.okAdmin = g.okRdAddr = 1;
-        if( configure_is_exportable(zName) & origConfigRcvMask ){
-          if( zName[0]!='@' ){
-            if( strcmp(zName, "logo-image")==0 ){
-              Stmt ins;
-              db_prepare(&ins,
-                "REPLACE INTO config(name, value) VALUES(:name, :value)"
-              );
-              db_bind_text(&ins, ":name", zName);
-              db_bind_blob(&ins, ":value", &content);
-              db_step(&ins);
-              db_finalize(&ins);
-            }else{
-              db_multi_exec(
-                  "REPLACE INTO config(name,value) VALUES(%Q,%Q)",
-                  zName, blob_str(&content)
-              );
-            }
-          }else{
-            /* Notice that we are evaluating arbitrary SQL received from the
-            ** server.  But this can only happen if we have specifically
-            ** requested configuration information from the server, so
-            ** presumably the operator trusts the server.
-            */
-            db_multi_exec("%s", blob_str(&content));
-          }
-        }
-        nCardSent++;
+        g.perm.Admin = g.perm.RdAddr = 1;
+        configure_receive(zName, &content, origConfigRcvMask);
+        nCardRcvd++;
+        nArtifactRcvd++;
         blob_reset(&content);
         blob_seek(xfer.pIn, 1, BLOB_SEEK_CUR);
       }else
 
-      
+
       /*    cookie TEXT
       **
       ** The server might include a cookie in its reply.  The client
@@ -1239,17 +1784,55 @@ void client_sync(
         db_set("cookie", blob_str(&xfer.aToken[1]), 0);
       }else
 
+
+      /*    private
+      **
+      ** This card indicates that the next "file" or "cfile" will contain
+      ** private content.
+      */
+      if( blob_eq(&xfer.aToken[0], "private") ){
+        xfer.nextIsPrivate = 1;
+      }else
+
+
+      /*    clone_seqno N
+      **
+      ** When doing a clone, the server tries to send all of its artifacts
+      ** in sequence.  This card indicates the sequence number of the next
+      ** blob that needs to be sent.  If N<=0 that indicates that all blobs
+      ** have been sent.
+      */
+      if( blob_eq(&xfer.aToken[0], "clone_seqno") && xfer.nToken==2 ){
+        blob_is_int(&xfer.aToken[1], &cloneSeqno);
+      }else
+
       /*   message MESSAGE
       **
       ** Print a message.  Similar to "error" but does not stop processing.
       **
       ** If the "login failed" message is seen, clear the sync password prior
       ** to the next cycle.
-      */        
+      */
       if( blob_eq(&xfer.aToken[0],"message") && xfer.nToken==2 ){
         char *zMsg = blob_terminate(&xfer.aToken[1]);
         defossilize(zMsg);
-        if( zMsg ) fossil_print("\rServer says: %s\n", zMsg);
+        if( (syncFlags & SYNC_PUSH) && zMsg && sqlite3_strglob("pull only *", zMsg)==0 ){
+          syncFlags &= ~SYNC_PUSH;
+          zMsg = 0;
+        }
+        if( zMsg && zMsg[0] ){
+          fossil_force_newline();
+          fossil_print("Server says: %s\n", zMsg);
+        }
+      }else
+
+      /*    pragma NAME VALUE...
+      **
+      ** The server can send pragmas to try to convey meta-information to
+      ** the client.  These are informational only.  Unknown pragmas are
+      ** silently ignored.
+      */
+      if( blob_eq(&xfer.aToken[0], "pragma") && xfer.nToken>=2 ){
       }else
 
       /*   error MESSAGE
@@ -1259,51 +1842,72 @@ void client_sync(
       ** Except, when cloning we will sometimes get an error on the
       ** first message exchange because the project-code is unknown
       ** and so the login card on the request was invalid.  The project-code
-      ** is returned in the reply before the error card, so second and 
+      ** is returned in the reply before the error card, so second and
       ** subsequent messages should be OK.  Nevertheless, we need to ignore
       ** the error card on the first message of a clone.
-      */        
+      */
       if( blob_eq(&xfer.aToken[0],"error") && xfer.nToken==2 ){
-        if( !cloneFlag || nCycle>0 ){
+        if( (syncFlags & SYNC_CLONE)==0 || nCycle>0 ){
           char *zMsg = blob_terminate(&xfer.aToken[1]);
           defossilize(zMsg);
-          if( strcmp(zMsg, "login failed")==0 ){
+          fossil_force_newline();
+          fossil_print("Error: %s\n", zMsg);
+          if( fossil_strcmp(zMsg, "login failed")==0 ){
             if( nCycle<2 ){
-              if( !g.dontKeepUrl ) db_unset("last-sync-pw", 0);
+              g.url.passwd = 0;
               go = 1;
+              if( g.cgiOutput==0 ){
+                g.url.flags |= URL_PROMPT_PW;
+                g.url.flags &= ~URL_PROMPTED;
+                url_prompt_for_password();
+                url_remember();
+              }
+            }else{
+              nErr++;
             }
           }else{
-            blob_appendf(&xfer.err, "\rserver says: %s", zMsg);
+            blob_appendf(&xfer.err, "server says: %s\n", zMsg);
+            nErr++;
           }
-          fossil_fatal("\rError: %s", zMsg);
+          break;
         }
       }else
 
       /* Unknown message */
-      {
+      if( xfer.nToken>0 ){
         if( blob_str(&xfer.aToken[0])[0]=='<' ){
-          fossil_fatal(
+          fossil_warning(
             "server replies with HTML instead of fossil sync protocol:\n%b",
             &recv
           );
+          nErr++;
+          break;
         }
-        blob_appendf(&xfer.err, "unknown command: %b", &xfer.aToken[0]);
+        blob_appendf(&xfer.err, "unknown command: [%b]\n", &xfer.aToken[0]);
       }
 
       if( blob_size(&xfer.err) ){
-        fossil_fatal("%b", &xfer.err);
+        fossil_force_newline();
+        fossil_warning("%b", &xfer.err);
+        nErr++;
+        break;
       }
       blobarray_reset(xfer.aToken, xfer.nToken);
       blob_reset(&xfer.line);
     }
-    if( origConfigRcvMask & (CONFIGSET_TKT|CONFIGSET_USER) ){
+    if( (configRcvMask & (CONFIGSET_USER|CONFIGSET_TKT))!=0
+     && (configRcvMask & CONFIGSET_OLDFORMAT)!=0
+    ){
       configure_finalize_receive();
     }
     origConfigRcvMask = 0;
-    if( nCardRcvd>0 ){
-      fossil_print(zValueFormat, "Received:",
+    if( nCardRcvd>0 && (syncFlags & SYNC_VERBOSE) ){
+      fossil_print(zValueFormat /*works-like:"%s%d%d%d%d"*/, "Received:",
                    blob_size(&recv), nCardRcvd,
                    xfer.nFileRcvd, xfer.nDeltaRcvd + xfer.nDanglingFile);
+    }else{
+      fossil_print(zBriefFormat /*works-like:"%d%d%d"*/,
+                   nRoundtrip, nArtifactSent, nArtifactRcvd);
     }
     blob_reset(&recv);
     nCycle++;
@@ -1316,6 +1920,8 @@ void client_sync(
       go = 1;
       mxPhantomReq = nFileRecv*2;
       if( mxPhantomReq<200 ) mxPhantomReq = 200;
+    }else if( (syncFlags & SYNC_CLONE)!=0 && nFileRecv>0 ){
+      go = 1;
     }
     nCardRcvd = 0;
     xfer.nFileRcvd = 0;
@@ -1323,21 +1929,56 @@ void client_sync(
     xfer.nDanglingFile = 0;
 
     /* If we have one or more files queued to send, then go
-    ** another round 
+    ** another round
     */
     if( xfer.nFileSent+xfer.nDeltaSent>0 ){
       go = 1;
     }
 
     /* If this is a clone, the go at least two rounds */
-    if( cloneFlag && nCycle==1 ) go = 1;
+    if( (syncFlags & SYNC_CLONE)!=0 && nCycle==1 ) go = 1;
+
+    /* Stop the cycle if the server sends a "clone_seqno 0" card and
+    ** we have gone at least two rounds.  Always go at least two rounds
+    ** on a clone in order to be sure to retrieve the configuration
+    ** information which is only sent on the second round.
+    */
+    if( cloneSeqno<=0 && nCycle>1 ) go = 0;
+    db_multi_exec("DROP TABLE onremote");
+    if( go ){
+      manifest_crosslink_end(MC_PERMIT_HOOKS);
+    }else{
+      manifest_crosslink_end(MC_PERMIT_HOOKS);
+      content_enable_dephantomize(1);
+    }
+    db_end_transaction(0);
   };
   transport_stats(&nSent, &nRcvd, 1);
-  fossil_print("Total network traffic: %d bytes sent, %d bytes received\n",
-               nSent, nRcvd);
-  transport_close();
-  transport_global_shutdown();
-  db_multi_exec("DROP TABLE onremote");
-  manifest_crosslink_end();
-  db_end_transaction(0);
+  if( (rSkew*24.0*3600.0) > 10.0 ){
+     fossil_warning("*** time skew *** server is fast by %s",
+                    db_timespan_name(rSkew));
+     g.clockSkewSeen = 1;
+  }else if( rSkew*24.0*3600.0 < -10.0 ){
+     fossil_warning("*** time skew *** server is slow by %s",
+                    db_timespan_name(-rSkew));
+     g.clockSkewSeen = 1;
+  }
+
+  fossil_force_newline();
+  fossil_print(
+     "%s done, sent: %lld  received: %lld  ip: %s\n",
+     zOpType, nSent, nRcvd, g.zIpAddr);
+  transport_close(&g.url);
+  transport_global_shutdown(&g.url);
+  if( nErr && go==2 ){
+    db_multi_exec("DROP TABLE onremote");
+    manifest_crosslink_end(MC_PERMIT_HOOKS);
+    content_enable_dephantomize(1);
+    db_end_transaction(0);
+  }
+  if( (syncFlags & SYNC_CLONE)==0 && g.rcvid && fossil_any_has_fork(g.rcvid) ){
+    fossil_warning("***** WARNING: a fork has occurred *****\n"
+                   "use \"fossil leaves -multiple\" for more details.");
+  }
+  return nErr;
 }

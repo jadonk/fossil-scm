@@ -15,7 +15,7 @@
 **
 *******************************************************************************
 **
-** This file contains code used to help verify the integrity of the
+** This file contains code used to help verify the integrity of
 ** the repository.
 **
 ** This file primarily implements the verify_before_commit() interface.
@@ -37,13 +37,13 @@
 */
 static void verify_rid(int rid){
   Blob uuid, hash, content;
-  if( db_int(0, "SELECT size FROM blob WHERE rid=%d", rid)<0 ){
+  if( content_size(rid, 0)<0 ){
     return;  /* No way to verify phantoms */
   }
   blob_zero(&uuid);
   db_blob(&uuid, "SELECT uuid FROM blob WHERE rid=%d", rid);
   if( blob_size(&uuid)!=UUID_SIZE ){
-    fossil_panic("not a valid rid: %d", rid);
+    fossil_fatal("not a valid rid: %d", rid);
   }
   if( content_get(rid, &content) ){
     sha1sum_blob(&content, &hash);
@@ -65,7 +65,7 @@ static Bag toVerify;
 static int inFinalVerify = 0;
 
 /*
-** This routine is called just prior to each commit operation.  
+** This routine is called just prior to each commit operation.
 **
 ** Invoke verify_rid() on every record that has been added or modified
 ** in the repository, in order to make sure that the repository is sane.
@@ -86,7 +86,7 @@ static int verify_at_commit(void){
 
 /*
 ** Arrange to verify a particular record prior to committing.
-** 
+**
 ** If the record rid is less than 1, then just initialize the
 ** verification system but do not record anything as needing
 ** verification.

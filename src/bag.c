@@ -77,7 +77,7 @@ void bag_clear(Bag *p){
 ** it contains N slots
 **
 ** Completely reconstruct the hash table from scratch.  Deleted
-** entries (indicated by a -1) are removed.  When finished, it 
+** entries (indicated by a -1) are removed.  When finished, it
 ** should be the case that p->cnt==p->used.
 */
 static void bag_resize(Bag *p, int newSize){
@@ -88,7 +88,7 @@ static void bag_resize(Bag *p, int newSize){
 
   old = *p;
   assert( newSize>old.cnt );
-  p->a = malloc( sizeof(p->a[0])*newSize );
+  p->a = fossil_malloc( sizeof(p->a[0])*newSize );
   p->sz = newSize;
   memset(p->a, 0, sizeof(p->a[0])*newSize );
   for(i=0; i<old.sz; i++){

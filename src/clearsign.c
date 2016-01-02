@@ -41,7 +41,7 @@ int clearsign(Blob *pIn, Blob *pOut){
   zIn = mprintf("in-%z", zRand);
   blob_write_to_file(pIn, zOut);
   zCmd = mprintf("%s %s %s", zBase, zIn, zOut);
-  rc = portable_system(zCmd);
+  rc = fossil_system(zCmd);
   free(zCmd);
   if( rc==0 ){
     if( pOut==pIn ){
@@ -54,8 +54,8 @@ int clearsign(Blob *pIn, Blob *pOut){
       blob_copy(pOut, pIn);
     }
   }
-  unlink(zOut);
-  unlink(zIn);
+  file_delete(zOut);
+  file_delete(zIn);
   free(zOut);
   free(zIn);
   return rc;

@@ -28,14 +28,12 @@
 **
 **     0:   There is an existing checkout but it is unmodified
 **     1:   There is a modified checkout - there are unsaved changes
-**     2:   There is no existing checkout
 */
-int unsaved_changes(void){
+int unsaved_changes(unsigned int cksigFlags){
   int vid;
   db_must_be_within_tree();
   vid = db_lget_int("checkout",0);
-  if( vid==0 ) return 2;
-  vfile_check_signature(vid, 1);
+  vfile_check_signature(vid, cksigFlags|CKSIG_ENOTFILE);
   return db_exists("SELECT 1 FROM vfile WHERE chnged"
                    " OR coalesce(origname!=pathname,0)");
 }
@@ -45,8 +43,9 @@ int unsaved_changes(void){
 ** Clear the VFILE table.
 */
 void uncheckout(int vid){
-  if( vid==0 ) return;
-  vfile_unlink(vid);
+  if( vid>0 ){
+    vfile_unlink(vid);
+  }
   db_multi_exec("DELETE FROM vfile WHERE vid=%d", vid);
 }
 
@@ -57,113 +56,120 @@ void uncheckout(int vid){
 **
 ** If anything goes wrong, panic.
 */
-int load_vfile(const char *zName){
+int load_vfile(const char *zName, int forceMissingFlag){
   Blob uuid;
   int vid;
 
   blob_init(&uuid, zName, -1);
-  if( name_to_uuid(&uuid, 1) ){
-    fossil_panic(g.zErrMsg);
+  if( name_to_uuid(&uuid, 1, "ci") ){
+    fossil_fatal("%s", g.zErrMsg);
   }
   vid = db_int(0, "SELECT rid FROM blob WHERE uuid=%B", &uuid);
   if( vid==0 ){
     fossil_fatal("no such check-in: %s", g.argv[2]);
   }
   if( !is_a_version(vid) ){
-    fossil_fatal("object [%.10s] is not a check-in", blob_str(&uuid));
+    fossil_fatal("object [%S] is not a check-in", blob_str(&uuid));
   }
-  load_vfile_from_rid(vid);
+  if( load_vfile_from_rid(vid) && !forceMissingFlag ){
+    fossil_fatal("missing content, unable to checkout");
+  };
   return vid;
-}
-
-/*
-** Load a vfile from a record ID.
-*/
-void load_vfile_from_rid(int vid){
-  Blob manifest;
-
-  if( db_exists("SELECT 1 FROM vfile WHERE vid=%d", vid) ){
-    return;
-  }
-  content_get(vid, &manifest);
-  vfile_build(vid, &manifest);
-  blob_reset(&manifest);
 }
 
 /*
 ** Set or clear the vfile.isexe flag for a file.
 */
 static void set_or_clear_isexe(const char *zFilename, int vid, int onoff){
-  db_multi_exec("UPDATE vfile SET isexe=%d WHERE vid=%d and pathname=%Q",
-                onoff, vid, zFilename);
+  static Stmt s;
+  db_static_prepare(&s,
+    "UPDATE vfile SET isexe=:isexe"
+    " WHERE vid=:vid AND pathname=:path AND isexe!=:isexe"
+  );
+  db_bind_int(&s, ":isexe", onoff);
+  db_bind_int(&s, ":vid", vid);
+  db_bind_text(&s, ":path", zFilename);
+  db_step(&s);
+  db_reset(&s);
 }
 
 /*
 ** Set or clear the execute permission bit (as appropriate) for all
-** files in the current check-out.
-**
-** If the checkout does not have explicit files named "manifest" and
-** "manifest.uuid" then automatically generate files with those names
-** containing, respectively, the text of the manifest and the artifact
-** ID of the manifest.
+** files in the current check-out, and replace files that have
+** symlink bit with actual symlinks.
+*/
+void checkout_set_all_exe(int vid){
+  Blob filename;
+  int baseLen;
+  Manifest *pManifest;
+  ManifestFile *pFile;
+
+  /* Check the EXE permission status of all files
+  */
+  pManifest = manifest_get(vid, CFTYPE_MANIFEST, 0);
+  if( pManifest==0 ) return;
+  blob_zero(&filename);
+  blob_appendf(&filename, "%s", g.zLocalRoot);
+  baseLen = blob_size(&filename);
+  manifest_file_rewind(pManifest);
+  while( (pFile = manifest_file_next(pManifest, 0))!=0 ){
+    int isExe;
+    blob_append(&filename, pFile->zName, -1);
+    isExe = pFile->zPerm && strstr(pFile->zPerm, "x");
+    file_wd_setexe(blob_str(&filename), isExe);
+    set_or_clear_isexe(pFile->zName, vid, isExe);
+    blob_resize(&filename, baseLen);
+  }
+  blob_reset(&filename);
+  manifest_destroy(pManifest);
+}
+
+
+/*
+** If the "manifest" setting is true, then automatically generate
+** files named "manifest" and "manifest.uuid" containing, respectively,
+** the text of the manifest and the artifact ID of the manifest.
 */
 void manifest_to_disk(int vid){
   char *zManFile;
   Blob manifest;
   Blob hash;
-  Blob filename;
-  int baseLen;
-  int i;
-  int seenManifest = 0;
-  int seenManifestUuid = 0;
-  Manifest m;
 
-  /* Check the EXE permission status of all files
-  */
-  blob_zero(&manifest);
-  content_get(vid, &manifest);
-  manifest_parse(&m, &manifest);
-  blob_zero(&filename);
-  blob_appendf(&filename, "%s/", g.zLocalRoot);
-  baseLen = blob_size(&filename);
-  for(i=0; i<m.nFile; i++){ 
-    int isExe;
-    blob_append(&filename, m.aFile[i].zName, -1);
-    isExe = m.aFile[i].zPerm && strstr(m.aFile[i].zPerm, "x");
-    file_setexe(blob_str(&filename), isExe);
-    set_or_clear_isexe(m.aFile[i].zName, vid, isExe);
-    blob_resize(&filename, baseLen);
-    if( memcmp(m.aFile[i].zName, "manifest", 8)==0 ){
-      if( m.aFile[i].zName[8]==0 ) seenManifest = 1;
-      if( strcmp(&m.aFile[i].zName[8], ".uuid")==0 ) seenManifestUuid = 1;
-    }
-  }
-  blob_reset(&filename);
-  manifest_clear(&m);
-
-  blob_zero(&manifest);
-  content_get(vid, &manifest);
-  if( !seenManifest ){
+  if( db_get_boolean("manifest",0) ){
+    blob_zero(&manifest);
+    content_get(vid, &manifest);
     zManFile = mprintf("%smanifest", g.zLocalRoot);
-    blob_write_to_file(&manifest, zManFile);
-    free(zManFile);
-  }
-  if( !seenManifestUuid ){
     blob_zero(&hash);
     sha1sum_blob(&manifest, &hash);
+    sterilize_manifest(&manifest);
+    blob_write_to_file(&manifest, zManFile);
+    free(zManFile);
     zManFile = mprintf("%smanifest.uuid", g.zLocalRoot);
     blob_append(&hash, "\n", 1);
     blob_write_to_file(&hash, zManFile);
     free(zManFile);
     blob_reset(&hash);
+  }else{
+    if( !db_exists("SELECT 1 FROM vfile WHERE pathname='manifest'") ){
+      zManFile = mprintf("%smanifest", g.zLocalRoot);
+      file_delete(zManFile);
+      free(zManFile);
+    }
+    if( !db_exists("SELECT 1 FROM vfile WHERE pathname='manifest.uuid'") ){
+      zManFile = mprintf("%smanifest.uuid", g.zLocalRoot);
+      file_delete(zManFile);
+      free(zManFile);
+    }
   }
+
 }
 
 /*
-** COMMAND: checkout
-** COMMAND: co
+** COMMAND: checkout*
+** COMMAND: co*
 **
-** Usage: %fossil checkout VERSION ?-f|--force? ?--keep?
+** Usage: %fossil checkout ?VERSION | --latest? ?OPTIONS?
+**    or: %fossil co ?VERSION | --latest? ?OPTIONS?
 **
 ** Check out a version specified on the command-line.  This command
 ** will abort if there are edited files in the current checkout unless
@@ -174,27 +180,38 @@ void manifest_to_disk(int vid){
 ** The --latest flag can be used in place of VERSION to checkout the
 ** latest version in the repository.
 **
-** See also the "update" command.
+** Options:
+**    --force           Ignore edited files in the current checkout
+**    --keep            Only update the manifest and manifest.uuid files
+**    --force-missing   Force checkout even if content is missing
+**
+** See also: update
 */
 void checkout_cmd(void){
   int forceFlag;                 /* Force checkout even if edits exist */
+  int forceMissingFlag;          /* Force checkout even if missing content */
   int keepFlag;                  /* Do not change any files on disk */
   int latestFlag;                /* Checkout the latest version */
   char *zVers;                   /* Version to checkout */
   int promptFlag;                /* True to prompt before overwriting */
   int vid, prior;
   Blob cksum1, cksum1b, cksum2;
-  
+
   db_must_be_within_tree();
   db_begin_transaction();
   forceFlag = find_option("force","f",0)!=0;
+  forceMissingFlag = find_option("force-missing",0,0)!=0;
   keepFlag = find_option("keep",0,0)!=0;
   latestFlag = find_option("latest",0,0)!=0;
-  promptFlag = find_option("prompt",0,0)!=0;  /* Prompt user before overwrite */
+  promptFlag = find_option("prompt",0,0)!=0 || forceFlag==0;
+
+  /* We should be done with options.. */
+  verify_all_options();
+
   if( (latestFlag!=0 && g.argc!=2) || (latestFlag==0 && g.argc!=3) ){
      usage("VERSION|--latest ?--force? ?--keep?");
   }
-  if( !forceFlag && unsaved_changes()==1 ){
+  if( !forceFlag && unsaved_changes(0) ){
     fossil_fatal("there are unsaved changes in the current checkout");
   }
   if( forceFlag ){
@@ -214,12 +231,12 @@ void checkout_cmd(void){
                          " ORDER BY event.mtime DESC");
     }
     if( zVers==0 ){
-      fossil_fatal("cannot locate \"latest\" checkout");
+      return;
     }
   }else{
     zVers = g.argv[2];
   }
-  vid = load_vfile(zVers);
+  vid = load_vfile(zVers, forceMissingFlag);
   if( prior==vid ){
     return;
   }
@@ -230,18 +247,20 @@ void checkout_cmd(void){
   if( !keepFlag ){
     vfile_to_disk(vid, 0, 1, promptFlag);
   }
+  checkout_set_all_exe(vid);
   manifest_to_disk(vid);
+  ensure_empty_dirs_created();
   db_lset_int("checkout", vid);
   undo_reset();
   db_multi_exec("DELETE FROM vmerge");
-  if( !keepFlag ){
+  if( !keepFlag && db_get_boolean("repo-cksum",1) ){
     vfile_aggregate_checksum_manifest(vid, &cksum1, &cksum1b);
     vfile_aggregate_checksum_disk(vid, &cksum2);
     if( blob_compare(&cksum1, &cksum2) ){
-      printf("WARNING: manifest checksum does not agree with disk\n");
+      fossil_print("WARNING: manifest checksum does not agree with disk\n");
     }
     if( blob_size(&cksum1b) && blob_compare(&cksum1, &cksum1b) ){
-      printf("WARNING: manifest checksum does not agree with manifest\n");
+      fossil_print("WARNING: manifest checksum does not agree with manifest\n");
     }
   }
   db_end_transaction(0);
@@ -250,40 +269,55 @@ void checkout_cmd(void){
 /*
 ** Unlink the local database file
 */
-void unlink_local_database(void){
-  static const char *azFile[] = {
-     "%s_FOSSIL_",
-     "%s_FOSSIL_-journal",
-     "%s_FOSSIL_-wal",
-     "%s_FOSSIL_-shm",
-     "%s.fos",
-     "%s.fos-journal",
-     "%s.fos-wal",
-     "%s.fos-shm",
-  };
+static void unlink_local_database(int manifestOnly){
+  const char *zReserved;
   int i;
-  for(i=0; i<sizeof(azFile)/sizeof(azFile[0]); i++){
-    char *z = mprintf(azFile[i], g.zLocalRoot);
-    unlink(z);
-    free(z);
+  for(i=0; (zReserved = fossil_reserved_name(i, 1))!=0; i++){
+    if( manifestOnly==0 || zReserved[0]=='m' ){
+      char *z;
+      z = mprintf("%s%s", g.zLocalRoot, zReserved);
+      file_delete(z);
+      free(z);
+    }
   }
 }
 
 /*
-** COMMAND: close
+** COMMAND: close*
 **
-** Usage: %fossil close ?-f|--force?
+** Usage: %fossil close ?OPTIONS?
 **
 ** The opposite of "open".  Close the current database connection.
 ** Require a -f or --force flag if there are unsaved changed in the
-** current check-out.
+** current check-out or if there is non-empty stash.
+**
+** Options:
+**   --force|-f  necessary to close a check out with uncommitted changes
+**
+** See also: open
 */
 void close_cmd(void){
   int forceFlag = find_option("force","f",0)!=0;
   db_must_be_within_tree();
-  if( !forceFlag && unsaved_changes()==1 ){
+
+  /* We should be done with options.. */
+  verify_all_options();
+
+  if( !forceFlag && unsaved_changes(0) ){
     fossil_fatal("there are unsaved changes in the current checkout");
   }
-  db_close();
-  unlink_local_database();
+  if( !forceFlag
+   && db_table_exists("localdb","stash")
+   && db_exists("SELECT 1 FROM %s.stash", db_name("localdb"))
+  ){
+    fossil_fatal("closing the checkout will delete your stash");
+  }
+  if( db_is_writeable("repository") ){
+    char *zUnset = mprintf("ckout:%q", g.zLocalRoot);
+    db_unset(zUnset, 1);
+    fossil_free(zUnset);
+  }
+  unlink_local_database(1);
+  db_close(1);
+  unlink_local_database(0);
 }

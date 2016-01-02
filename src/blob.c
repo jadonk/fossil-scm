@@ -19,8 +19,17 @@
 ** or binary data.
 */
 #include "config.h"
-#include <zlib.h>
+#if defined(FOSSIL_ENABLE_MINIZ)
+#  define MINIZ_HEADER_FILE_ONLY
+#  include "miniz.c"
+#else
+#  include <zlib.h>
+#endif
 #include "blob.h"
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #if INTERFACE
 /*
@@ -31,9 +40,15 @@ struct Blob {
   unsigned int nUsed;            /* Number of bytes used in aData[] */
   unsigned int nAlloc;           /* Number of bytes allocated for aData[] */
   unsigned int iCursor;          /* Next character of input to parse */
+  unsigned int blobFlags;        /* One or more BLOBFLAG_* bits */
   char *aData;                   /* Where the information is stored */
   void (*xRealloc)(Blob*, unsigned int); /* Function to reallocate the buffer */
 };
+
+/*
+** Allowed values for Blob.blobFlags
+*/
+#define BLOBFLAG_NotSQL  0x0001      /* Non-SQL text */
 
 /*
 ** The current size of a Blob
@@ -62,36 +77,64 @@ struct Blob {
 
 /*
 ** Make sure a blob does not contain malloced memory.
+**
+** This might fail if we are unlucky and x is uninitialized.  For that
+** reason it should only be used locally for debugging.  Leave it turned
+** off for production.
 */
 #if 0  /* Enable for debugging only */
-#define blob_is_reset(x) \
-  assert((x)->xRealloc!=blobReallocMalloc || (x)->nAlloc==0)
+#define assert_blob_is_reset(x) assert(blob_is_reset(x))
 #else
-#define blob_is_reset(x)
+#define assert_blob_is_reset(x)
 #endif
+
+
 
 /*
 ** We find that the built-in isspace() function does not work for
 ** some international character sets.  So here is a substitute.
 */
-int blob_isspace(char c){
+int fossil_isspace(char c){
   return c==' ' || (c<='\r' && c>='\t');
 }
 
 /*
+** Other replacements for ctype.h functions.
+*/
+int fossil_islower(char c){ return c>='a' && c<='z'; }
+int fossil_isupper(char c){ return c>='A' && c<='Z'; }
+int fossil_isdigit(char c){ return c>='0' && c<='9'; }
+int fossil_tolower(char c){
+  return fossil_isupper(c) ? c - 'A' + 'a' : c;
+}
+int fossil_toupper(char c){
+  return fossil_islower(c) ? c - 'a' + 'A' : c;
+}
+int fossil_isalpha(char c){
+  return (c>='a' && c<='z') || (c>='A' && c<='Z');
+}
+int fossil_isalnum(char c){
+  return (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9');
+}
+
+
+/*
 ** COMMAND: test-isspace
+**
+** Verify that the fossil_isspace() routine is working correctly but
+** testing it on all possible inputs.
 */
 void isspace_cmd(void){
   int i;
   for(i=0; i<=255; i++){
     if( i==' ' || i=='\n' || i=='\t' || i=='\v'
         || i=='\f' || i=='\r' ){
-      assert( blob_isspace((char)i) );
+      assert( fossil_isspace((char)i) );
     }else{
-      assert( !blob_isspace((char)i) );
+      assert( !fossil_isspace((char)i) );
     }
   }
-  printf("All 256 characters OK\n");
+  fossil_print("All 256 characters OK\n");
 }
 
 /*
@@ -100,14 +143,14 @@ void isspace_cmd(void){
 */
 static void blob_panic(void){
   static const char zErrMsg[] = "out of memory\n";
-  write(2, zErrMsg, sizeof(zErrMsg)-1);
+  fputs(zErrMsg, stderr);
   fossil_exit(1);
 }
 
 /*
 ** A reallocation function that assumes that aData came from malloc().
 ** This function attempts to resize the buffer of the blob to hold
-** newSize bytes.  
+** newSize bytes.
 **
 ** No attempt is made to recover from an out-of-memory error.
 ** If an OOM error occurs, an error message is printed on stderr
@@ -120,9 +163,9 @@ void blobReallocMalloc(Blob *pBlob, unsigned int newSize){
     pBlob->nAlloc = 0;
     pBlob->nUsed = 0;
     pBlob->iCursor = 0;
+    pBlob->blobFlags = 0;
   }else if( newSize>pBlob->nAlloc || newSize<pBlob->nAlloc-4000 ){
-    char *pNew = realloc(pBlob->aData, newSize);
-    if( pNew==0 ) blob_panic();
+    char *pNew = fossil_realloc(pBlob->aData, newSize);
     pBlob->aData = pNew;
     pBlob->nAlloc = newSize;
     if( pBlob->nUsed>pBlob->nAlloc ){
@@ -135,7 +178,7 @@ void blobReallocMalloc(Blob *pBlob, unsigned int newSize){
 ** An initializer for Blobs
 */
 #if INTERFACE
-#define BLOB_INITIALIZER  {0,0,0,0,blobReallocMalloc}
+#define BLOB_INITIALIZER  {0,0,0,0,0,blobReallocMalloc}
 #endif
 const Blob empty_blob = BLOB_INITIALIZER;
 
@@ -147,8 +190,7 @@ static void blobReallocStatic(Blob *pBlob, unsigned int newSize){
   if( newSize==0 ){
     *pBlob = empty_blob;
   }else{
-    char *pNew = malloc( newSize );
-    if( pNew==0 ) blob_panic();
+    char *pNew = fossil_malloc( newSize );
     if( pBlob->nUsed>newSize ) pBlob->nUsed = newSize;
     memcpy(pNew, pBlob->aData, pBlob->nUsed);
     pBlob->aData = pNew;
@@ -165,12 +207,25 @@ void blob_reset(Blob *pBlob){
   pBlob->xRealloc(pBlob, 0);
 }
 
+
+/*
+** Return true if the blob has been zeroed - in other words if it contains
+** no malloced memory.  This only works reliably if the blob has been
+** initialized - it can return a false negative on an uninitialized blob.
+*/
+int blob_is_reset(Blob *pBlob){
+  if( pBlob==0 ) return 1;
+  if( pBlob->nUsed ) return 0;
+  if( pBlob->xRealloc==blobReallocMalloc && pBlob->nAlloc ) return 0;
+  return 1;
+}
+
 /*
 ** Initialize a blob to a string or byte-array constant of a specified length.
 ** Any prior data in the blob is discarded.
 */
 void blob_init(Blob *pBlob, const char *zData, int size){
-  blob_is_reset(pBlob);
+  assert_blob_is_reset(pBlob);
   if( zData==0 ){
     *pBlob = empty_blob;
   }else{
@@ -178,6 +233,7 @@ void blob_init(Blob *pBlob, const char *zData, int size){
     pBlob->nUsed = pBlob->nAlloc = size;
     pBlob->aData = (char*)zData;
     pBlob->iCursor = 0;
+    pBlob->blobFlags = 0;
     pBlob->xRealloc = blobReallocStatic;
   }
 }
@@ -191,15 +247,25 @@ void blob_set(Blob *pBlob, const char *zStr){
 }
 
 /*
+** Initialize a blob to a nul-terminated string obtained from fossil_malloc().
+** The blob will take responsibility for freeing the string.
+*/
+void blob_set_dynamic(Blob *pBlob, char *zStr){
+  blob_init(pBlob, zStr, -1);
+  pBlob->xRealloc = blobReallocMalloc;
+}
+
+/*
 ** Initialize a blob to an empty string.
 */
 void blob_zero(Blob *pBlob){
   static const char zEmpty[] = "";
-  blob_is_reset(pBlob);
+  assert_blob_is_reset(pBlob);
   pBlob->nUsed = 0;
   pBlob->nAlloc = 1;
   pBlob->aData = (char*)zEmpty;
   pBlob->iCursor = 0;
+  pBlob->blobFlags = 0;
   pBlob->xRealloc = blobReallocStatic;
 }
 
@@ -207,6 +273,7 @@ void blob_zero(Blob *pBlob){
 ** Append text or data to the end of a blob.
 */
 void blob_append(Blob *pBlob, const char *aData, int nData){
+  assert( aData!=0 || nData==0 );
   blob_is_init(pBlob);
   if( nData<0 ) nData = strlen(aData);
   if( nData==0 ) return;
@@ -236,7 +303,7 @@ void blob_copy(Blob *pTo, Blob *pFrom){
 char *blob_str(Blob *p){
   blob_is_init(p);
   if( p->nUsed==0 ){
-    blob_append(p, "", 1);
+    blob_append(p, "", 1); /* NOTE: Changes nUsed. */
     p->nUsed = 0;
   }
   if( p->aData[p->nUsed]!=0 ){
@@ -244,6 +311,20 @@ char *blob_str(Blob *p){
   }
   return p->aData;
 }
+
+/*
+** Return a pointer to a null-terminated string for a blob that has
+** been created using blob_append_sql() and not blob_appendf().  If
+** text was ever added using blob_appendf() then throw an error.
+*/
+char *blob_sql_text(Blob *p){
+  blob_is_init(p);
+  if( (p->blobFlags & BLOBFLAG_NotSQL) ){
+    fossil_fatal("Internal error: Use of blob_appendf() to construct SQL text");
+  }
+  return blob_str(p);
+}
+
 
 /*
 ** Return a pointer to a null-terminated string for a blob.
@@ -266,7 +347,8 @@ char *blob_terminate(Blob *p){
 }
 
 /*
-** Compare two blobs.
+** Compare two blobs.  Return negative, zero, or positive if the first
+** blob is less then, equal to, or greater than the second.
 */
 int blob_compare(Blob *pA, Blob *pB){
   int szA, szB, sz, rc;
@@ -279,6 +361,32 @@ int blob_compare(Blob *pA, Blob *pB){
   if( rc==0 ){
     rc = szA - szB;
   }
+  return rc;
+}
+
+/*
+** Compare two blobs in constant time and return zero if they are equal.
+** Constant time comparison only applies for blobs of the same length.
+** If lengths are different, immediately returns 1.
+*/
+int blob_constant_time_cmp(Blob *pA, Blob *pB){
+  int szA, szB, i;
+  unsigned char *buf1, *buf2;
+  unsigned char rc = 0;
+
+  blob_is_init(pA);
+  blob_is_init(pB);
+  szA = blob_size(pA);
+  szB = blob_size(pB);
+  if( szA!=szB || szA==0 ) return 1;
+
+  buf1 = (unsigned char*)blob_buffer(pA);
+  buf2 = (unsigned char*)blob_buffer(pB);
+
+  for( i=0; i<szA; i++ ){
+    rc = rc | (buf1[i] ^ buf2[i]);
+  }
+
   return rc;
 }
 
@@ -307,7 +415,7 @@ int blob_eq_str(Blob *pBlob, const char *z, int n){
 
 
 /*
-** Attempt to resize a blob so that its internal buffer is 
+** Attempt to resize a blob so that its internal buffer is
 ** nByte in size.  The blob is truncated if necessary.
 */
 void blob_resize(Blob *pBlob, unsigned int newSize){
@@ -318,7 +426,7 @@ void blob_resize(Blob *pBlob, unsigned int newSize){
 
 /*
 ** Make sure a blob is nul-terminated and is not a pointer to unmanaged
-** space.  Return a pointer to the
+** space.  Return a pointer to the data.
 */
 char *blob_materialize(Blob *pBlob){
   blob_resize(pBlob, pBlob->nUsed);
@@ -343,7 +451,7 @@ void blob_dehttpize(Blob *pBlob){
 */
 int blob_extract(Blob *pFrom, int N, Blob *pTo){
   blob_is_init(pFrom);
-  blob_is_reset(pTo);
+  assert_blob_is_reset(pTo);
   if( pFrom->iCursor + N > pFrom->nUsed ){
     N = pFrom->nUsed - pFrom->iCursor;
     if( N<=0 ){
@@ -378,9 +486,6 @@ int blob_seek(Blob *p, int offset, int whence){
   }else if( whence==BLOB_SEEK_END ){
     p->iCursor = p->nUsed + offset - 1;
   }
-  if( p->iCursor<0 ){
-    p->iCursor = 0;
-  }
   if( p->iCursor>p->nUsed ){
     p->iCursor = p->nUsed;
   }
@@ -395,7 +500,7 @@ int blob_tell(Blob *p){
 }
 
 /*
-** Extract a single line of text from pFrom beginning at the current 
+** Extract a single line of text from pFrom beginning at the current
 ** cursor location and use that line of text to initialize pTo.
 ** pTo will include the terminating \n.  Return the number of bytes
 ** in the line including the \n at the end.  0 is returned at
@@ -431,7 +536,7 @@ int blob_line(Blob *pFrom, Blob *pTo){
 int blob_trim(Blob *p){
   char *z = p->aData;
   int n = p->nUsed;
-  while( n>0 && blob_isspace(z[n-1]) ){ n--; }
+  while( n>0 && fossil_isspace(z[n-1]) ){ n--; }
   p->nUsed = n;
   return n;
 }
@@ -454,11 +559,49 @@ int blob_token(Blob *pFrom, Blob *pTo){
   char *aData = pFrom->aData;
   int n = pFrom->nUsed;
   int i = pFrom->iCursor;
-  while( i<n && blob_isspace(aData[i]) ){ i++; }
+  while( i<n && fossil_isspace(aData[i]) ){ i++; }
   pFrom->iCursor = i;
-  while( i<n && !blob_isspace(aData[i]) ){ i++; }
+  while( i<n && !fossil_isspace(aData[i]) ){ i++; }
   blob_extract(pFrom, i-pFrom->iCursor, pTo);
-  while( i<n && blob_isspace(aData[i]) ){ i++; }
+  while( i<n && fossil_isspace(aData[i]) ){ i++; }
+  pFrom->iCursor = i;
+  return pTo->nUsed;
+}
+
+/*
+** Extract a single SQL token from pFrom and use it to initialize pTo.
+** Return the number of bytes in the token.  If no token is found,
+** return 0.
+**
+** An SQL token consists of one or more non-space characters.  If the
+** first character is ' then the token is terminated by a matching '
+** (ignoring double '') or by the end of the string
+**
+** The cursor of pFrom is left pointing at the first character past
+** the end of the token.
+**
+** pTo will be an ephermeral blob.  If pFrom changes, it might alter
+** pTo as well.
+*/
+int blob_sqltoken(Blob *pFrom, Blob *pTo){
+  char *aData = pFrom->aData;
+  int n = pFrom->nUsed;
+  int i = pFrom->iCursor;
+  while( i<n && fossil_isspace(aData[i]) ){ i++; }
+  pFrom->iCursor = i;
+  if( aData[i]=='\'' ){
+    i++;
+    while( i<n ){
+      if( aData[i]=='\'' ){
+        if( aData[++i]!='\'' ) break;
+      }
+      i++;
+    }
+  }else{
+    while( i<n && !fossil_isspace(aData[i]) ){ i++; }
+  }
+  blob_extract(pFrom, i-pFrom->iCursor, pTo);
+  while( i<n && fossil_isspace(aData[i]) ){ i++; }
   pFrom->iCursor = i;
   return pTo->nUsed;
 }
@@ -525,7 +668,7 @@ int blob_is_int(Blob *pBlob, int *pValue){
   int i, n, c, v;
   n = blob_size(pBlob);
   v = 0;
-  for(i=0; i<n && (c = z[i])!=0 && isdigit(c); i++){
+  for(i=0; i<n && (c = z[i])!=0 && c>='0' && c<='9'; i++){
     v = v*10 + c - '0';
   }
   if( i==n ){
@@ -561,19 +704,33 @@ int blob_tokenize(Blob *pIn, Blob *aToken, int nToken){
 
 /*
 ** Do printf-style string rendering and append the results to a blob.
+**
+** The blob_appendf() version sets the BLOBFLAG_NotSQL bit in Blob.blobFlags
+** whereas blob_append_sql() does not.
 */
 void blob_appendf(Blob *pBlob, const char *zFormat, ...){
-  va_list ap;
-  va_start(ap, zFormat);
-  vxprintf(pBlob, zFormat, ap);
-  va_end(ap);
+  if( pBlob ){
+    va_list ap;
+    va_start(ap, zFormat);
+    vxprintf(pBlob, zFormat, ap);
+    va_end(ap);
+    pBlob->blobFlags |= BLOBFLAG_NotSQL;
+  }
+}
+void blob_append_sql(Blob *pBlob, const char *zFormat, ...){
+  if( pBlob ){
+    va_list ap;
+    va_start(ap, zFormat);
+    vxprintf(pBlob, zFormat, ap);
+    va_end(ap);
+  }
 }
 void blob_vappendf(Blob *pBlob, const char *zFormat, va_list ap){
-  vxprintf(pBlob, zFormat, ap);
+  if( pBlob ) vxprintf(pBlob, zFormat, ap);
 }
 
 /*
-** Initalize a blob to the data on an input channel.  Return 
+** Initialize a blob to the data on an input channel.  Return
 ** the number of bytes read into the blob.  Any prior content
 ** of the blob is discarded, not freed.
 */
@@ -602,7 +759,8 @@ int blob_read_from_channel(Blob *pBlob, FILE *in, int nToRead){
 **
 ** Any prior content of the blob is discarded, not freed.
 **
-** Return the number of bytes read.  Return -1 for an error.
+** Return the number of bytes read. Calls fossil_fatal() on error (i.e.
+** it exit()s and does not return).
 */
 int blob_read_from_file(Blob *pBlob, const char *zFilename){
   int size, got;
@@ -611,18 +769,18 @@ int blob_read_from_file(Blob *pBlob, const char *zFilename){
         || (zFilename[0]=='-' && zFilename[1]==0) ){
     return blob_read_from_channel(pBlob, stdin, -1);
   }
-  size = file_size(zFilename);
+  size = file_wd_size(zFilename);
   blob_zero(pBlob);
   if( size<0 ){
-    fossil_panic("no such file: %s", zFilename);
+    fossil_fatal("no such file: %s", zFilename);
   }
   if( size==0 ){
     return 0;
   }
   blob_resize(pBlob, size);
-  in = fopen(zFilename, "rb");
+  in = fossil_fopen(zFilename, "rb");
   if( in==0 ){
-    fossil_panic("cannot open %s for reading", zFilename);
+    fossil_fatal("cannot open %s for reading", zFilename);
   }
   got = fread(blob_buffer(pBlob), 1, size, in);
   fclose(in);
@@ -633,6 +791,32 @@ int blob_read_from_file(Blob *pBlob, const char *zFilename){
 }
 
 /*
+** Reads symlink destination path and puts int into blob.
+** Any prior content of the blob is discarded, not freed.
+**
+** Returns length of destination path.
+**
+** On windows, zeros blob and returns 0.
+*/
+int blob_read_link(Blob *pBlob, const char *zFilename){
+#if !defined(_WIN32)
+  char zBuf[1024];
+  ssize_t len = readlink(zFilename, zBuf, 1023);
+  if( len < 0 ){
+    fossil_fatal("cannot read symbolic link %s", zFilename);
+  }
+  zBuf[len] = 0;   /* null-terminate */
+  blob_zero(pBlob);
+  blob_appendf(pBlob, "%s", zBuf);
+  return len;
+#else
+  blob_zero(pBlob);
+  return 0;
+#endif
+}
+
+
+/*
 ** Write the content of a blob into a file.
 **
 ** If the filename is blank or "-" then write to standard output.
@@ -641,67 +825,45 @@ int blob_read_from_file(Blob *pBlob, const char *zFilename){
 */
 int blob_write_to_file(Blob *pBlob, const char *zFilename){
   FILE *out;
-  int needToClose;
-  int wrote;
+  int nWrote;
 
   if( zFilename[0]==0 || (zFilename[0]=='-' && zFilename[1]==0) ){
-    out = stdout;
-    needToClose = 0;
+    nWrote = blob_size(pBlob);
+#if defined(_WIN32)
+    if( fossil_utf8_to_console(blob_buffer(pBlob), nWrote, 0) >= 0 ){
+      return nWrote;
+    }
+    fflush(stdout);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    fwrite(blob_buffer(pBlob), 1, nWrote, stdout);
+#if defined(_WIN32)
+    fflush(stdout);
+    _setmode(_fileno(stdout), _O_TEXT);
+#endif
   }else{
-    int i, nName;
-    char *zName, zBuf[1000];
-
-    nName = strlen(zFilename);
-    if( nName>=sizeof(zBuf) ){
-      zName = mprintf("%s", zFilename);
-    }else{
-      zName = zBuf;
-      strcpy(zName, zFilename);
-    }
-    nName = file_simplify_name(zName, nName);
-    for(i=1; i<nName; i++){
-      if( zName[i]=='/' ){
-        zName[i] = 0;
-#if defined(_WIN32)
-        /*
-        ** On Windows, local path looks like: C:/develop/project/file.txt
-        ** The if stops us from trying to create a directory of a drive letter
-        ** C: in this example.
-        */
-        if( !(i==2 && zName[1]==':') ){
-#endif
-          if( file_mkdir(zName, 1) ){
-            fossil_fatal_recursive("unable to create directory %s", zName);
-            return 0;
-          }
-#if defined(_WIN32)
-        }
-#endif
-        zName[i] = '/';
-      }
-    }
-    out = fopen(zName, "wb");
+    file_mkfolder(zFilename, 1, 0);
+    out = fossil_fopen(zFilename, "wb");
     if( out==0 ){
-      fossil_fatal_recursive("unable to open file \"%s\" for writing", zName);
+      fossil_fatal_recursive("unable to open file \"%s\" for writing",
+                             zFilename);
       return 0;
     }
-    needToClose = 1;
-    if( zName!=zBuf ) free(zName);
+    blob_is_init(pBlob);
+    nWrote = fwrite(blob_buffer(pBlob), 1, blob_size(pBlob), out);
+    fclose(out);
+    if( nWrote!=blob_size(pBlob) ){
+      fossil_fatal_recursive("short write: %d of %d bytes to %s", nWrote,
+         blob_size(pBlob), zFilename);
+    }
   }
-  blob_is_init(pBlob);
-  wrote = fwrite(blob_buffer(pBlob), 1, blob_size(pBlob), out);
-  if( needToClose ) fclose(out);
-  if( wrote!=blob_size(pBlob) ){
-    fossil_fatal_recursive("short write: %d of %d bytes to %s", wrote,
-       blob_size(pBlob), zFilename);
-  }
-  return wrote;
+  return nWrote;
 }
 
 /*
 ** Compress a blob pIn.  Store the result in pOut.  It is ok for pIn and
-** pOut to be the same blob. 
-** 
+** pOut to be the same blob.
+**
 ** pOut must either be the same as pIn or else uninitialized.
 */
 void blob_compress(Blob *pIn, Blob *pOut){
@@ -721,13 +883,19 @@ void blob_compress(Blob *pIn, Blob *pOut){
   compress(&outBuf[4], &nOut2,
            (unsigned char*)blob_buffer(pIn), blob_size(pIn));
   if( pOut==pIn ) blob_reset(pOut);
-  blob_is_reset(pOut);
+  assert_blob_is_reset(pOut);
   *pOut = temp;
   blob_resize(pOut, nOut2+4);
 }
 
 /*
 ** COMMAND: test-compress
+**
+** Usage: %fossil test-compress INPUTFILE OUTPUTFILE
+**
+** Run compression on INPUTFILE and write the result into OUTPUTFILE.
+**
+** This is used to test and debug the blob_compress() routine.
 */
 void compress_cmd(void){
   Blob f;
@@ -738,9 +906,9 @@ void compress_cmd(void){
 }
 
 /*
-** Compress the concatenation of a blobs pIn1 and pIn2.  Store the result 
-** in pOut. 
-** 
+** Compress the concatenation of a blobs pIn1 and pIn2.  Store the result
+** in pOut.
+**
 ** pOut must be either uninitialized or must be the same as either pIn1 or
 ** pIn2.
 */
@@ -774,12 +942,19 @@ void blob_compress2(Blob *pIn1, Blob *pIn2, Blob *pOut){
   deflateEnd(&stream);
   if( pOut==pIn1 ) blob_reset(pOut);
   if( pOut==pIn2 ) blob_reset(pOut);
-  blob_is_reset(pOut);
+  assert_blob_is_reset(pOut);
   *pOut = temp;
 }
 
 /*
 ** COMMAND: test-compress-2
+**
+** Usage: %fossil test-compress-2 IN1 IN2 OUT
+**
+** Read files IN1 and IN2, concatenate the content, compress the
+** content, then write results into OUT.
+**
+** This is used to test and debug the blob_compress2() routine.
 */
 void compress2_cmd(void){
   Blob f1, f2;
@@ -811,21 +986,27 @@ int blob_uncompress(Blob *pIn, Blob *pOut){
   blob_zero(&temp);
   blob_resize(&temp, nOut+1);
   nOut2 = (long int)nOut;
-  rc = uncompress((unsigned char*)blob_buffer(&temp), &nOut2, 
-                  &inBuf[4], blob_size(pIn));
+  rc = uncompress((unsigned char*)blob_buffer(&temp), &nOut2,
+                  &inBuf[4], nIn - 4);
   if( rc!=Z_OK ){
     blob_reset(&temp);
     return 1;
   }
   blob_resize(&temp, nOut2);
   if( pOut==pIn ) blob_reset(pOut);
-  blob_is_reset(pOut);
+  assert_blob_is_reset(pOut);
   *pOut = temp;
   return 0;
 }
 
 /*
 ** COMMAND: test-uncompress
+**
+** Usage: %fossil test-uncompress IN OUT
+**
+** Read the content of file IN, uncompress that content, and write the
+** result into OUT.  This command is intended for testing of the the
+** blob_compress() function.
 */
 void uncompress_cmd(void){
   Blob f;
@@ -849,16 +1030,16 @@ void test_cycle_compress(void){
     blob_compress(&b1, &b2);
     blob_uncompress(&b2, &b3);
     if( blob_compare(&b1, &b3) ){
-      fossil_panic("compress/uncompress cycle failed for %s", g.argv[i]);
+      fossil_fatal("compress/uncompress cycle failed for %s", g.argv[i]);
     }
     blob_reset(&b1);
     blob_reset(&b2);
     blob_reset(&b3);
   }
-  printf("ok\n");
+  fossil_print("ok\n");
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__CYGWIN__)
 /*
 ** Convert every \n character in the given blob into \r\n.
 */
@@ -885,18 +1066,73 @@ void blob_add_cr(Blob *p){
 #endif
 
 /*
-** Remove every \r character from the given blob.
+** Remove every \r character from the given blob, replacing each one with
+** a \n character if it was not already part of a \r\n pair.
 */
-void blob_remove_cr(Blob *p){
+void blob_to_lf_only(Blob *p){
   int i, j;
-  char *z;
-  blob_materialize(p);
-  z = p->aData;
+  char *z = blob_materialize(p);
   for(i=j=0; z[i]; i++){
     if( z[i]!='\r' ) z[j++] = z[i];
+    else if( z[i+1]!='\n' ) z[j++] = '\n';
   }
   z[j] = 0;
   p->nUsed = j;
+}
+
+/*
+** Convert blob from cp1252 to UTF-8. As cp1252 is a superset
+** of iso8859-1, this is useful on UNIX as well.
+**
+** This table contains the character translations for 0x80..0xA0.
+*/
+
+static const unsigned short cp1252[32] = {
+  0x20ac,   0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+  0x02C6, 0x2030, 0x0160, 0x2039, 0x0152,   0x8D, 0x017D,   0x8F,
+    0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+   0x2DC, 0x2122, 0x0161, 0x203A, 0x0153,   0x9D, 0x017E, 0x0178
+};
+
+void blob_cp1252_to_utf8(Blob *p){
+  unsigned char *z = (unsigned char *)p->aData;
+  int j   = p->nUsed;
+  int i, n;
+  for(i=n=0; i<j; i++){
+    if( z[i]>=0x80 ){
+      if( (z[i]<0xa0) && (cp1252[z[i]&0x1f]>=0x800) ){
+        n++;
+      }
+      n++;
+    }
+  }
+  j += n;
+  if( j>=p->nAlloc ){
+    blob_resize(p, j);
+    z = (unsigned char *)p->aData;
+  }
+  p->nUsed = j;
+  z[j] = 0;
+  while( j>i ){
+    if( z[--i]>=0x80 ){
+      if( z[i]<0xa0 ){
+        unsigned short sym = cp1252[z[i]&0x1f];
+        if( sym>=0x800 ){
+          z[--j] = 0x80 | (sym&0x3f);
+          z[--j] = 0x80 | ((sym>>6)&0x3f);
+          z[--j] = 0xe0 | (sym>>12);
+        }else{
+          z[--j] = 0x80 | (sym&0x3f);
+          z[--j] = 0xc0 | (sym>>6);
+        }
+      }else{
+        z[--j] = 0x80 | (z[i]&0x3f);
+        z[--j] = 0xC0 | (z[i]>>6);
+      }
+    }else{
+      z[--j] = z[i];
+    }
+  }
 }
 
 /*
@@ -908,7 +1144,7 @@ void shell_escape(Blob *pBlob, const char *zIn){
   int i, c;
   char *z;
   for(i=0; (c = zIn[i])!=0; i++){
-    if( isspace(c) || c=='"' || (c=='\\' && zIn[i+1]!=0) ){
+    if( fossil_isspace(c) || c=='"' || (c=='\\' && zIn[i+1]!=0) ){
       blob_appendf(pBlob, "\"%s\"", zIn);
       z = blob_buffer(pBlob);
       for(i=n+1; i<=n+k; i++){
@@ -918,4 +1154,88 @@ void shell_escape(Blob *pBlob, const char *zIn){
     }
   }
   blob_append(pBlob, zIn, -1);
+}
+
+/*
+** A read(2)-like impl for the Blob class. Reads (copies) up to nLen
+** bytes from pIn, starting at position pIn->iCursor, and copies them
+** to pDest (which must be valid memory at least nLen bytes long).
+**
+** Returns the number of bytes read/copied, which may be less than
+** nLen (if end-of-blob is encountered).
+**
+** Updates pIn's cursor.
+**
+** Returns 0 if pIn contains no data.
+*/
+unsigned int blob_read(Blob *pIn, void * pDest, unsigned int nLen ){
+  if( !pIn->aData || (pIn->iCursor >= pIn->nUsed) ){
+    return 0;
+  } else if( (pIn->iCursor + nLen) > (unsigned int)pIn->nUsed ){
+    nLen = (unsigned int) (pIn->nUsed - pIn->iCursor);
+  }
+  assert( pIn->nUsed > pIn->iCursor );
+  assert( (pIn->iCursor+nLen)  <= pIn->nUsed );
+  if( nLen ){
+    memcpy( pDest, pIn->aData, nLen );
+    pIn->iCursor += nLen;
+  }
+  return nLen;
+}
+
+/*
+** Swaps the contents of the given blobs. Results
+** are unspecified if either value is NULL or both
+** point to the same blob.
+*/
+void blob_swap( Blob *pLeft, Blob *pRight ){
+  Blob swap = *pLeft;
+  *pLeft = *pRight;
+  *pRight = swap;
+}
+
+/*
+** Strip a possible byte-order-mark (BOM) from the blob. On Windows, if there
+** is either no BOM at all or an (le/be) UTF-16 BOM, a conversion to UTF-8 is
+** done.  If useMbcs is false and there is no BOM, the input string is assumed
+** to be UTF-8 already, so no conversion is done.
+*/
+void blob_to_utf8_no_bom(Blob *pBlob, int useMbcs){
+  char *zUtf8;
+  int bomSize = 0;
+  int bomReverse = 0;
+  if( starts_with_utf8_bom(pBlob, &bomSize) ){
+    struct Blob temp;
+    zUtf8 = blob_str(pBlob) + bomSize;
+    blob_zero(&temp);
+    blob_append(&temp, zUtf8, -1);
+    blob_swap(pBlob, &temp);
+    blob_reset(&temp);
+  }else if( starts_with_utf16_bom(pBlob, &bomSize, &bomReverse) ){
+    zUtf8 = blob_buffer(pBlob);
+    if( bomReverse ){
+      /* Found BOM, but with reversed bytes */
+      unsigned int i = blob_size(pBlob);
+      while( i>0 ){
+        /* swap bytes of unicode representation */
+        char zTemp = zUtf8[--i];
+        zUtf8[i] = zUtf8[i-1];
+        zUtf8[--i] = zTemp;
+      }
+    }
+    /* Make sure the blob contains two terminating 0-bytes */
+    blob_append(pBlob, "", 1);
+    zUtf8 = blob_str(pBlob) + bomSize;
+    zUtf8 = fossil_unicode_to_utf8(zUtf8);
+    blob_set_dynamic(pBlob, zUtf8);
+  }else if( useMbcs && invalid_utf8(pBlob) ){
+#if defined(_WIN32) || defined(__CYGWIN__)
+    zUtf8 = fossil_mbcs_to_utf8(blob_str(pBlob));
+    blob_reset(pBlob);
+    blob_append(pBlob, zUtf8, -1);
+    fossil_mbcs_free(zUtf8);
+#else
+    blob_cp1252_to_utf8(pBlob);
+#endif /* _WIN32 */
+  }
 }

@@ -17,9 +17,14 @@
 **
 ** This file contains code used to generate ZIP archives.
 */
-#include <assert.h>
-#include <zlib.h>
 #include "config.h"
+#include <assert.h>
+#if defined(FOSSIL_ENABLE_MINIZ)
+#  define MINIZ_HEADER_FILE_ONLY
+#  include "miniz.c"
+#else
+#  include <zlib.h>
+#endif
 #include "zip.h"
 
 /*
@@ -83,7 +88,7 @@ void zip_set_timedate_from_str(const char *zDate){
 void zip_set_timedate(double rDate){
   char *zDate = db_text(0, "SELECT datetime(%.17g)", rDate);
   zip_set_timedate_from_str(zDate);
-  free(zDate);
+  fossil_free(zDate);
   unixTime = (rDate - 2440587.5)*86400.0;
 }
 
@@ -100,13 +105,13 @@ void zip_add_folders(char *zName){
       c = zName[i+1];
       zName[i+1] = 0;
       for(j=0; j<nDir; j++){
-        if( strcmp(zName, azDir[j])==0 ) break;
+        if( fossil_strcmp(zName, azDir[j])==0 ) break;
       }
       if( j>=nDir ){
         nDir++;
-        azDir = realloc(azDir, sizeof(azDir[0])*nDir);
+        azDir = fossil_realloc(azDir, sizeof(azDir[0])*nDir);
         azDir[j] = mprintf("%s", zName);
-        zip_add_file(zName, 0);
+        zip_add_file(zName, 0, 0);
       }
       zName[i+1] = c;
     }
@@ -119,7 +124,7 @@ void zip_add_folders(char *zName){
 ** pFile is the file to be appended.  zName is the name
 ** that the file should be saved as.
 */
-void zip_add_file(const char *zName, const Blob *pFile){
+void zip_add_file(const char *zName, const Blob *pFile, int mPerm){
   z_stream stream;
   int nameLen;
   int toOut = 0;
@@ -141,7 +146,11 @@ void zip_add_file(const char *zName, const Blob *pFile){
   nBlob = pFile ? blob_size(pFile) : 0;
   if( nBlob>0 ){
     iMethod = 8;
-    iMode = 0100644;
+    switch( mPerm ){
+      case PERM_LNK:   iMode = 0120755;   break;
+      case PERM_EXE:   iMode = 0100755;   break;
+      default:         iMode = 0100644;   break;
+    }
   }else{
     iMethod = 0;
     iMode = 040755;
@@ -150,19 +159,19 @@ void zip_add_file(const char *zName, const Blob *pFile){
   memset(zHdr, 0, sizeof(zHdr));
   put32(&zHdr[0], 0x04034b50);
   put16(&zHdr[4], 0x000a);
-  put16(&zHdr[6], 0);
+  put16(&zHdr[6], 0x0800);
   put16(&zHdr[8], iMethod);
   put16(&zHdr[10], dosTime);
   put16(&zHdr[12], dosDate);
   put16(&zHdr[26], nameLen);
   put16(&zHdr[28], 13);
-  
+
   put16(&zExTime[0], 0x5455);
   put16(&zExTime[2], 9);
   zExTime[4] = 3;
   put32(&zExTime[5], unixTime);
   put32(&zExTime[9], unixTime);
-  
+
 
   /* Write the header and filename.
   */
@@ -200,7 +209,7 @@ void zip_add_file(const char *zName, const Blob *pFile){
     nByte = stream.total_in;
     nByteCompr = stream.total_out;
     deflateEnd(&stream);
-  
+
     /* Go back and write the header, now that we know the compressed file size.
     */
     z = &blob_buffer(&body)[iStart];
@@ -208,14 +217,14 @@ void zip_add_file(const char *zName, const Blob *pFile){
     put32(&z[18], nByteCompr);
     put32(&z[22], nByte);
   }
-  
+
   /* Make an entry in the tables of contents
   */
   memset(zBuf, 0, sizeof(zBuf));
   put32(&zBuf[0], 0x02014b50);
   put16(&zBuf[4], 0x0317);
   put16(&zBuf[6], 0x000a);
-  put16(&zBuf[8], 0);
+  put16(&zBuf[8], 0x0800);
   put16(&zBuf[10], iMethod);
   put16(&zBuf[12], dosTime);
   put16(&zBuf[14], dosDate);
@@ -265,9 +274,9 @@ void zip_close(Blob *pZip){
   blob_zero(&body);
   nEntry = 0;
   for(i=0; i<nDir; i++){
-    free(azDir[i]);
+    fossil_free(azDir[i]);
   }
-  free(azDir);
+  fossil_free(azDir);
   nDir = 0;
   azDir = 0;
 }
@@ -289,7 +298,7 @@ void filezip_cmd(void){
   for(i=3; i<g.argc; i++){
     blob_zero(&file);
     blob_read_from_file(&file, g.argv[i]);
-    zip_add_file(g.argv[i], &file);
+    zip_add_file(g.argv[i], &file, file_wd_perm(g.argv[i]));
     blob_reset(&file);
   }
   zip_close(&zip);
@@ -315,20 +324,18 @@ void filezip_cmd(void){
 **
 */
 void zip_of_baseline(int rid, Blob *pZip, const char *zDir){
-  int i;
-  Blob mfile, file, hash;
-  Manifest m;
+  Blob mfile, hash, file;
+  Manifest *pManifest;
+  ManifestFile *pFile;
   Blob filename;
   int nPrefix;
-  
+
   content_get(rid, &mfile);
   if( blob_size(&mfile)==0 ){
     blob_zero(pZip);
     return;
   }
-  blob_zero(&file);
   blob_zero(&hash);
-  blob_copy(&file, &mfile);
   blob_zero(&filename);
   zip_open();
 
@@ -337,46 +344,50 @@ void zip_of_baseline(int rid, Blob *pZip, const char *zDir){
   }
   nPrefix = blob_size(&filename);
 
-  if( manifest_parse(&m, &mfile) ){
+  pManifest = manifest_get(rid, CFTYPE_MANIFEST, 0);
+  if( pManifest ){
     char *zName;
-    zip_set_timedate(m.rDate);
-    blob_append(&filename, "manifest", -1);
-    zName = blob_str(&filename);
-    zip_add_folders(zName);
-    zip_add_file(zName, &file);
-    sha1sum_blob(&file, &hash);
-    blob_reset(&file);
-    blob_append(&hash, "\n", 1);
-    blob_resize(&filename, nPrefix);
-    blob_append(&filename, "manifest.uuid", -1);
-    zName = blob_str(&filename);
-    zip_add_file(zName, &hash);
-    blob_reset(&hash);
-    for(i=0; i<m.nFile; i++){
-      int fid = uuid_to_rid(m.aFile[i].zUuid, 0);
+    zip_set_timedate(pManifest->rDate);
+    if( db_get_boolean("manifest", 0) ){
+      blob_append(&filename, "manifest", -1);
+      zName = blob_str(&filename);
+      zip_add_folders(zName);
+      sha1sum_blob(&mfile, &hash);
+      sterilize_manifest(&mfile);
+      zip_add_file(zName, &mfile, 0);
+      blob_reset(&mfile);
+      blob_append(&hash, "\n", 1);
+      blob_resize(&filename, nPrefix);
+      blob_append(&filename, "manifest.uuid", -1);
+      zName = blob_str(&filename);
+      zip_add_file(zName, &hash, 0);
+      blob_reset(&hash);
+    }
+    manifest_file_rewind(pManifest);
+    while( (pFile = manifest_file_next(pManifest,0))!=0 ){
+      int fid = uuid_to_rid(pFile->zUuid, 0);
       if( fid ){
         content_get(fid, &file);
         blob_resize(&filename, nPrefix);
-        blob_append(&filename, m.aFile[i].zName, -1);
+        blob_append(&filename, pFile->zName, -1);
         zName = blob_str(&filename);
         zip_add_folders(zName);
-        zip_add_file(zName, &file);
+        zip_add_file(zName, &file, manifest_file_mperm(pFile));
         blob_reset(&file);
       }
     }
-    manifest_clear(&m);
   }else{
     blob_reset(&mfile);
-    blob_reset(&file);
   }
+  manifest_destroy(pManifest);
   blob_reset(&filename);
   zip_close(pZip);
 }
 
 /*
-** COMMAND: zip
+** COMMAND: zip*
 **
-** Usage: %fossil zip VERSION OUTPUTFILE [--name DIRECTORYNAME]
+** Usage: %fossil zip VERSION OUTPUTFILE [--name DIRECTORYNAME] [-R|--repository REPO]
 **
 ** Generate a ZIP archive for a specified version.  If the --name option is
 ** used, it argument becomes the name of the top-level directory in the
@@ -389,11 +400,15 @@ void baseline_zip_cmd(void){
   Blob zip;
   const char *zName;
   zName = find_option("name", 0, 1);
-  db_find_and_open_repository(1);
+  db_find_and_open_repository(0, 0);
+
+  /* We should be done with options.. */
+  verify_all_options();
+
   if( g.argc!=4 ){
     usage("VERSION OUTPUTFILE");
   }
-  rid = name_to_rid(g.argv[2]);
+  rid = name_to_typed_rid(g.argv[2],"ci");
   if( zName==0 ){
     zName = db_text("default-name",
        "SELECT replace(%Q,' ','_') "
@@ -415,34 +430,72 @@ void baseline_zip_cmd(void){
 **
 ** Generate a ZIP archive for the baseline.
 ** Return that ZIP archive as the HTTP reply content.
+**
+** Optional URL Parameters:
+**
+** - name=NAME[.zip] is the name of the output file. Defaults to
+** something project/version-specific. The base part of the
+** name, up to the last dot, is used as the top-most directory
+** name in the output file.
+**
+** - uuid=the version to zip (may be a tag/branch name).
+** Defaults to "trunk".
+**
 */
 void baseline_zip_page(void){
   int rid;
   char *zName, *zRid;
   int nName, nRid;
   Blob zip;
+  char *zKey;
 
   login_check_credentials();
-  if( !g.okZip ){ login_needed(); return; }
+  if( !g.perm.Zip ){ login_needed(g.anon.Zip); return; }
+  load_control();
   zName = mprintf("%s", PD("name",""));
   nName = strlen(zName);
-  zRid = mprintf("%s", PD("uuid",""));
+  zRid = mprintf("%s", PD("uuid","trunk"));
   nRid = strlen(zRid);
-  for(nName=strlen(zName)-1; nName>5; nName--){
-    if( zName[nName]=='.' ){
-      zName[nName] = 0;
-      break;
+  if( nName>4 && fossil_strcmp(&zName[nName-4], ".zip")==0 ){
+    /* Special case:  Remove the ".zip" suffix.  */
+    nName -= 4;
+    zName[nName] = 0;
+  }else{
+    /* If the file suffix is not ".zip" then just remove the
+    ** suffix up to and including the last "." */
+    for(nName=strlen(zName)-1; nName>5; nName--){
+      if( zName[nName]=='.' ){
+        zName[nName] = 0;
+        break;
+      }
     }
   }
-  rid = name_to_rid(nRid?zRid:zName);
+  rid = name_to_typed_rid(nRid?zRid:zName,"ci");
   if( rid==0 ){
     @ Not found
     return;
   }
+  if( referred_from_login() ){
+    style_header("ZIP Archive Download");
+    @ <form action='%R/zip/%h(zName).zip'>
+    cgi_query_parameters_to_hidden();
+    @ <p>ZIP Archive named <b>%h(zName).zip</b> holding the content
+    @ of check-in <b>%h(zRid)</b>:
+    @ <input type="submit" value="Download" />
+    @ </form>
+    style_footer();
+    return;
+  }
   if( nRid==0 && nName>10 ) zName[10] = 0;
-  zip_of_baseline(rid, &zip, zName);
-  free( zName );
-  free( zRid );
+  zKey = db_text(0, "SELECT '/zip/'||uuid||'/%q' FROM blob WHERE rid=%d",zName,rid);
+  blob_zero(&zip);
+  if( cache_read(&zip, zKey)==0 ){
+    zip_of_baseline(rid, &zip, zName);
+    cache_write(&zip, zKey);
+  }
+  fossil_free( zName );
+  fossil_free( zRid );
+  fossil_free( zKey );
   cgi_set_content(&zip);
   cgi_set_content_type("application/zip");
 }

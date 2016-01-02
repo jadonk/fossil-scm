@@ -18,76 +18,34 @@
 ** This file contains code to implement the timeline web page
 **
 */
+#include "config.h"
 #include <string.h>
 #include <time.h>
-#include "config.h"
 #include "timeline.h"
 
 /*
-** Shorten a UUID so that is the minimum length needed to contain
-** at least one digit in the range 'a'..'f'.  The minimum length is 10.
+** The value of one second in julianday notation
 */
-static void shorten_uuid(char *zDest, const char *zSrc){
-  int i;
-  for(i=0; i<10 && zSrc[i]<='9'; i++){}
-  memcpy(zDest, zSrc, 10);
-  if( i==10 && zSrc[i] ){
-    do{
-      zDest[i] = zSrc[i];
-      i++;
-    }while( zSrc[i-1]<='9' );
-  }else{
-    i = 10;
-  }
-  zDest[i] = 0;
-}
+#define ONE_SECOND (1.0/86400.0)
 
+/*
+** Add an appropriate tag to the output if "rid" is unpublished (private)
+*/
+#define UNPUB_TAG "<em>(unpublished)</em>"
+void tag_private_status(int rid){
+  if( content_is_private(rid) ){
+    cgi_printf("%s", UNPUB_TAG);
+  }
+}
 
 /*
 ** Generate a hyperlink to a version.
 */
 void hyperlink_to_uuid(const char *zUuid){
-  char zShortUuid[UUID_SIZE+1];
-  shorten_uuid(zShortUuid, zUuid);
-  if( g.okHistory ){
-    @ <a class="timelineHistLink" href="%s(g.zBaseURL)/info/%s(zShortUuid)">
-    @ [%s(zShortUuid)]</a>
+  if( g.perm.Hyperlink ){
+    @ %z(xhref("class='timelineHistLink'","%R/info/%!S",zUuid))[%S(zUuid)]</a>
   }else{
-    @ <span class="timelineHistDsp">[%s(zShortUuid)]</span>
-  }
-}
-
-/*
-** Generate a hyperlink that invokes javascript to highlight
-** a version on mouseover.
-*/
-void hyperlink_to_uuid_with_mouseover(
-  const char *zUuid,   /* The UUID to display */
-  const char *zIn,     /* Javascript proc for mouseover */
-  const char *zOut,    /* Javascript proc for mouseout */
-  int id               /* Argument to javascript procs */
-){
-  char zShortUuid[UUID_SIZE+1];
-  shorten_uuid(zShortUuid, zUuid);
-  if( g.okHistory ){
-    @ <a onmouseover='%s(zIn)("m%d(id)")' onmouseout='%s(zOut)("m%d(id)")'
-    @    href="%s(g.zBaseURL)/vinfo/%s(zShortUuid)">[%s(zShortUuid)]</a>
-  }else{
-    @ <b onmouseover='%s(zIn)("m%d(id)")' onmouseout='%s(zOut)("m%d(id)")'>
-    @ [%s(zShortUuid)]</b>
-  }
-}
-
-/*
-** Generate a hyperlink to a diff between two versions.
-*/
-void hyperlink_to_diff(const char *zV1, const char *zV2){
-  if( g.okHistory ){
-    if( zV2==0 ){
-      @ <a href="%s(g.zBaseURL)/diff?v2=%s(zV1)">[diff]</a>
-    }else{
-      @ <a href="%s(g.zBaseURL)/diff?v1=%s(zV1)&amp;v2=%s(zV2)">[diff]</a>
-    }
+    @ <span class="timelineHistDsp">[%S(zUuid)]</span>
   }
 }
 
@@ -96,8 +54,8 @@ void hyperlink_to_diff(const char *zV1, const char *zV2){
 */
 void hyperlink_to_date(const char *zDate, const char *zSuffix){
   if( zSuffix==0 ) zSuffix = "";
-  if( g.okHistory ){
-    @ <a href="%s(g.zTop)/timeline?c=%T(zDate)">%s(zDate)</a>%s(zSuffix)
+  if( g.perm.Hyperlink ){
+    @ %z(href("%R/timeline?c=%T",zDate))%s(zDate)</a>%s(zSuffix)
   }else{
     @ %s(zDate)%s(zSuffix)
   }
@@ -109,38 +67,17 @@ void hyperlink_to_date(const char *zDate, const char *zSuffix){
 ** is centered on that date+time.
 */
 void hyperlink_to_user(const char *zU, const char *zD, const char *zSuf){
+  if( zU==0 || zU[0]==0 ) zU = "anonymous";
   if( zSuf==0 ) zSuf = "";
-  if( g.okHistory ){
+  if( g.perm.Hyperlink ){
     if( zD && zD[0] ){
-      @ <a href="%s(g.zTop)/timeline?c=%T(zD)&amp;u=%T(zU)">%h(zU)</a>%s(zSuf)
+      @ %z(href("%R/timeline?c=%T&u=%T",zD,zU))%h(zU)</a>%s(zSuf)
     }else{
-      @ <a href="%s(g.zTop)/timeline?u=%T(zU)">%h(zU)</a>%s(zSuf)
+      @ %z(href("%R/timeline?u=%T",zU))%h(zU)</a>%s(zSuf)
     }
   }else{
     @ %s(zU)
   }
-}
-
-/*
-** Count the number of primary non-branch children for the given check-in.
-**
-** A primary child is one where the parent is the primary parent, not
-** a merge parent.
-**
-** A non-branch child is one which is on the same branch as the parent.
-*/
-int count_nonbranch_children(int pid){
-  int nNonBranch;
-  static const char zSql[] = 
-    @ SELECT count(*) FROM plink
-    @  WHERE pid=%d AND isprim
-    @    AND coalesce((SELECT value FROM tagxref
-    @                   WHERE tagid=%d AND rid=plink.pid), 'trunk')
-    @       =coalesce((SELECT value FROM tagxref
-    @                   WHERE tagid=%d AND rid=plink.cid), 'trunk')
-  ;
-  nNonBranch = db_int(0, zSql, pid, TAG_BRANCH, TAG_BRANCH);
-  return nNonBranch;
 }
 
 /*
@@ -152,7 +89,111 @@ int count_nonbranch_children(int pid){
 #define TIMELINE_BRIEF    0x0004  /* Combine adjacent elements of same object */
 #define TIMELINE_GRAPH    0x0008  /* Compute a graph */
 #define TIMELINE_DISJOINT 0x0010  /* Elements are not contiguous */
+#define TIMELINE_FCHANGES 0x0020  /* Detail file changes */
+#define TIMELINE_BRCOLOR  0x0040  /* Background color by branch name */
+#define TIMELINE_UCOLOR   0x0080  /* Background color by user */
+#define TIMELINE_FRENAMES 0x0100  /* Detail only file name changes */
+#define TIMELINE_UNHIDE   0x0200  /* Unhide check-ins with "hidden" tag */
+#define TIMELINE_SHOWRID  0x0400  /* Show RID values in addition to UUIDs */
+#define TIMELINE_BISECT   0x0800  /* Show supplimental bisect information */
 #endif
+
+/*
+** Hash a string and use the hash to determine a background color.
+*/
+char *hash_color(const char *z){
+  int i;                       /* Loop counter */
+  unsigned int h = 0;          /* Hash on the branch name */
+  int r, g, b;                 /* Values for red, green, and blue */
+  int h1, h2, h3, h4;          /* Elements of the hash value */
+  int mx, mn;                  /* Components of HSV */
+  static char zColor[10];      /* The resulting color */
+  static int ix[2] = {0,0};    /* Color chooser parameters */
+
+  if( ix[0]==0 ){
+    if( skin_detail_boolean("white-foreground") ){
+      ix[0] = 140;
+      ix[1] = 40;
+    }else{
+      ix[0] = 216;
+      ix[1] = 16;
+    }
+  }
+  for(i=0; z[i]; i++ ){
+    h = (h<<11) ^ (h<<1) ^ (h>>3) ^ z[i];
+  }
+  h1 = h % 6;  h /= 6;
+  h3 = h % 30; h /= 30;
+  h4 = h % 40; h /= 40;
+  mx = ix[0] - h3;
+  mn = mx - h4 - ix[1];
+  h2 = (h%(mx - mn)) + mn;
+  switch( h1 ){
+    case 0:  r = mx; g = h2, b = mn;  break;
+    case 1:  r = h2; g = mx, b = mn;  break;
+    case 2:  r = mn; g = mx, b = h2;  break;
+    case 3:  r = mn; g = h2, b = mx;  break;
+    case 4:  r = h2; g = mn, b = mx;  break;
+    default: r = mx; g = mn, b = h2;  break;
+  }
+  sqlite3_snprintf(8, zColor, "#%02x%02x%02x", r,g,b);
+  return zColor;
+}
+
+/*
+** COMMAND:  test-hash-color
+**
+** Usage: %fossil test-hash-color TAG ...
+**
+** Print out the color names associated with each tag.  Used for
+** testing the hash_color() function.
+*/
+void test_hash_color(void){
+  int i;
+  for(i=2; i<g.argc; i++){
+    fossil_print("%20s: %s\n", g.argv[i], hash_color(g.argv[i]));
+  }
+}
+
+/*
+** WEBPAGE:  hash-color-test
+**
+** Print out the color names associated with each tag.  Used for
+** testing the hash_color() function.
+*/
+void test_hash_color_page(void){
+  const char *zBr;
+  char zNm[10];
+  int i, cnt;
+  login_check_credentials();
+
+  style_header("Hash Color Test");
+  for(i=cnt=0; i<10; i++){
+    sqlite3_snprintf(sizeof(zNm),zNm,"b%d",i);
+    zBr = P(zNm);
+    if( zBr && zBr[0] ){
+      @ <p style='border:1px solid;background-color:%s(hash_color(zBr));'>
+      @ %h(zBr) - %s(hash_color(zBr)) -
+      @ Omnes nos quasi oves erravimus unusquisque in viam
+      @ suam declinavit.</p>
+      cnt++;
+    }
+  }
+  if( cnt ){
+    @ <hr>
+  }
+  @ <form method="post" action="%s(g.zTop)/hash-color-test">
+  @ <p>Enter candidate branch names below and see them displayed in their
+  @ default background colors above.</p>
+  for(i=0; i<10; i++){
+    sqlite3_snprintf(sizeof(zNm),zNm,"b%d",i);
+    zBr = P(zNm);
+    @ <input type="text" size="30" name='%s(zNm)' value='%h(PD(zNm,""))'><br />
+  }
+  @ <input type="submit">
+  @ </form>
+  style_footer();
+}
 
 /*
 ** Output a timeline in the web format given a query.  The query
@@ -165,7 +206,7 @@ int count_nonbranch_children(int pid){
 **    4.  User
 **    5.  True if is a leaf
 **    6.  background color
-**    7.  type ("ci", "w", "t")
+**    7.  type ("ci", "w", "t", "e", "g", "div")
 **    8.  list of symbolic tags.
 **    9.  tagid for ticket or wiki or event
 **   10.  Short comment to user for repeated tickets and wiki
@@ -173,32 +214,45 @@ int count_nonbranch_children(int pid){
 void www_print_timeline(
   Stmt *pQuery,          /* Query to implement the timeline */
   int tmFlags,           /* Flags controlling display behavior */
+  const char *zThisUser, /* Suppress links to this user */
+  const char *zThisTag,  /* Suppress links to this tag */
+  int selectedRid,       /* Highlight the line with this RID value */
   void (*xExtra)(int)    /* Routine to call on each line of display */
 ){
-  int wikiFlags;
   int mxWikiLen;
   Blob comment;
   int prevTagid = 0;
   int suppressCnt = 0;
   char zPrevDate[20];
   GraphContext *pGraph = 0;
+  int prevWasDivider = 0;     /* True if previous output row was <hr> */
+  int fchngQueryInit = 0;     /* True if fchngQuery is initialized */
+  Stmt fchngQuery;            /* Query for file changes on check-ins */
+  static Stmt qbranch;
+  int pendingEndTr = 0;       /* True if a </td></tr> is needed */
+  int vid = 0;                /* Current checkout version */
+  int dateFormat = 0;         /* 0: HH:MM (default) */
+  int bCommentGitStyle = 0;   /* Only show comments through first blank line */
+  const char *zDateFmt;
 
+  if( fossil_strcmp(g.zIpAddr, "127.0.0.1")==0 && db_open_local(0) ){
+    vid = db_lget_int("checkout", 0);
+  }
   zPrevDate[0] = 0;
   mxWikiLen = db_get_int("timeline-max-comment", 0);
-  if( db_get_boolean("timeline-block-markup", 0) ){
-    wikiFlags = WIKI_INLINE;
-  }else{
-    wikiFlags = WIKI_INLINE | WIKI_NOBLOCK;
-  }
+  dateFormat = db_get_int("timeline-date-format", 0);
+  bCommentGitStyle = db_get_int("timeline-truncate-at-blank", 0);
+  zDateFmt = P("datefmt");
+  if( zDateFmt ) dateFormat = atoi(zDateFmt);
   if( tmFlags & TIMELINE_GRAPH ){
     pGraph = graph_init();
-    /* style is not moved to css, because this is
-    ** a technical div for the timeline graph
-    */
-    @ <div id="canvas" style="position:relative;width:1px;height:1px;"></div>
   }
+  db_static_prepare(&qbranch,
+    "SELECT value FROM tagxref WHERE tagid=%d AND tagtype>0 AND rid=:rid",
+    TAG_BRANCH
+  );
 
-  @ <table class="timelineTable">
+  @ <table id="timelineTable" class="timelineTable">
   blob_zero(&comment);
   while( db_step(pQuery)==SQLITE_ROW ){
     int rid = db_column_int(pQuery, 0);
@@ -210,9 +264,19 @@ void www_print_timeline(
     const char *zUser = db_column_text(pQuery, 4);
     const char *zTagList = db_column_text(pQuery, 8);
     int tagid = db_column_int(pQuery, 9);
+    const char *zDispUser = zUser && zUser[0] ? zUser : "anonymous";
+    const char *zBr = 0;      /* Branch */
     int commentColumn = 3;    /* Column containing comment text */
-    char zTime[8];
+    int modPending;           /* Pending moderation */
+    char *zDateLink;          /* URL for the link on the timestamp */
+    char zTime[20];
+
+    if( zDate==0 ){
+      zDate = "YYYY-MM-DD HH:MM:SS";  /* Something wrong with the repo */
+    }
+    modPending =  moderation_pending(rid);
     if( tagid ){
+      if( modPending ) tagid = -tagid;
       if( tagid==prevTagid ){
         if( tmFlags & TIMELINE_BRIEF ){
           suppressCnt++;
@@ -224,62 +288,133 @@ void www_print_timeline(
     }
     prevTagid = tagid;
     if( suppressCnt ){
-      @ <tr><td /><td /><td>
       @ <span class="timelineDisabled">... %d(suppressCnt) similar
-      @ event%s(suppressCnt>1?"s":"") omitted.</span></td></tr>
+      @ event%s(suppressCnt>1?"s":"") omitted.</span>
       suppressCnt = 0;
     }
-    if( strcmp(zType,"div")==0 ){
-      @ <tr><td colspan="3"><hr /></td></tr>
+    if( pendingEndTr ){
+      @ </td></tr>
+      if( pendingEndTr>1 ){
+        @ <tr class="timelineSpacer"></tr>
+      }
+      pendingEndTr = 0;
+    }
+    if( fossil_strcmp(zType,"div")==0 ){
+      if( !prevWasDivider ){
+        @ <tr><td colspan="3"><hr class="timelineMarker"/></td></tr>
+      }
+      prevWasDivider = 1;
       continue;
     }
-    if( memcmp(zDate, zPrevDate, 10) ){
-      sprintf(zPrevDate, "%.10s", zDate);
-      @ <tr><td>
-      @   <div class="divider">%s(zPrevDate)</div>
-      @ </td></tr>
-    }
-    memcpy(zTime, &zDate[11], 5);
-    zTime[5] = 0;
-    @ <tr>
-    @ <td class="timelineTime">%s(zTime)</td>
-    @ <td class="timelineGraph">
-    if( pGraph && zType[0]=='c' ){
-      int nParent = 0;
-      int aParent[32];
-      const char *zBr;
-      int gidx;
-      static Stmt qparent;
-      static Stmt qbranch;
-      db_static_prepare(&qparent,
-        "SELECT pid FROM plink WHERE cid=:rid ORDER BY isprim DESC /*sort*/"
-      );
-      db_static_prepare(&qbranch,
-        "SELECT value FROM tagxref WHERE tagid=%d AND tagtype>0 AND rid=:rid",
-        TAG_BRANCH
-      );
-      db_bind_int(&qparent, ":rid", rid);
-      while( db_step(&qparent)==SQLITE_ROW && nParent<32 ){
-        aParent[nParent++] = db_column_int(&qparent, 0);
+    prevWasDivider = 0;
+    /* Date format codes:
+    **   (0)  HH:MM
+    **   (1)  HH:MM:SS
+    **   (2)  YYYY-MM-DD HH:MM
+    **   (3)  YYMMDD HH:MM
+    **   (4)  (off)
+    */
+    if( dateFormat<2 ){
+      if( fossil_strnicmp(zDate, zPrevDate, 10) ){
+        sqlite3_snprintf(sizeof(zPrevDate), zPrevDate, "%.10s", zDate);
+        @ <tr><td>
+        @   <div class="divider timelineDate">%s(zPrevDate)</div>
+        @ </td><td></td><td></td></tr>
       }
-      db_reset(&qparent);
+      memcpy(zTime, &zDate[11], 5+dateFormat*3);
+      zTime[5+dateFormat*3] = 0;
+    }else if( 2==dateFormat ){
+      /* YYYY-MM-DD HH:MM */
+      sqlite3_snprintf(sizeof(zTime), zTime, "%.16s", zDate);
+    }else if( 3==dateFormat ){
+      /* YYMMDD HH:MM */
+      int pos = 0;
+      zTime[pos++] = zDate[2]; zTime[pos++] = zDate[3]; /* YY */
+      zTime[pos++] = zDate[5]; zTime[pos++] = zDate[6]; /* MM */
+      zTime[pos++] = zDate[8]; zTime[pos++] = zDate[9]; /* DD */
+      zTime[pos++] = ' ';
+      zTime[pos++] = zDate[11]; zTime[pos++] = zDate[12]; /* HH */
+      zTime[pos++] = ':';
+      zTime[pos++] = zDate[14]; zTime[pos++] = zDate[15]; /* MM */
+      zTime[pos++] = 0;
+    }else{
+      zTime[0] = 0;
+    }
+    pendingEndTr = 1;
+    if( rid==selectedRid ){
+      @ <tr class="timelineSpacer"></tr>
+      @ <tr class="timelineSelected">
+      pendingEndTr = 2;
+    }else if( rid==vid ){
+      @ <tr class="timelineCurrent">
+    }else {
+      @ <tr>
+    }
+    zDateLink = href("%R/timeline?c=%!S&unhide", zUuid);
+    @ <td class="timelineTime">%z(zDateLink)%s(zTime)</a></td>
+    @ <td class="timelineGraph">
+    if( tmFlags & TIMELINE_UCOLOR )  zBgClr = zUser ? hash_color(zUser) : 0;
+    if( zType[0]=='c'
+    && (pGraph || zBgClr==0 || (tmFlags & TIMELINE_BRCOLOR)!=0)
+    ){
+      db_reset(&qbranch);
       db_bind_int(&qbranch, ":rid", rid);
       if( db_step(&qbranch)==SQLITE_ROW ){
         zBr = db_column_text(&qbranch, 0);
       }else{
         zBr = "trunk";
       }
-      gidx = graph_add_row(pGraph, rid, nParent, aParent, zBr, zBgClr);
+      if( zBgClr==0 || (tmFlags & TIMELINE_BRCOLOR)!=0 ){
+        if( zBr==0 || strcmp(zBr,"trunk")==0 ){
+          zBgClr = 0;
+        }else{
+          zBgClr = hash_color(zBr);
+        }
+      }
+    }
+    if( zType[0]=='c' && (pGraph || (tmFlags & TIMELINE_BRCOLOR)!=0) ){
+      int nParent = 0;
+      int aParent[GR_MAX_RAIL];
+      int gidx;
+      static Stmt qparent;
+      db_static_prepare(&qparent,
+        "SELECT pid FROM plink"
+        " WHERE cid=:rid AND pid NOT IN phantom"
+        " ORDER BY isprim DESC /*sort*/"
+      );
+      db_bind_int(&qparent, ":rid", rid);
+      while( db_step(&qparent)==SQLITE_ROW && nParent<ArraySize(aParent) ){
+        aParent[nParent++] = db_column_int(&qparent, 0);
+      }
+      db_reset(&qparent);
+      gidx = graph_add_row(pGraph, rid, nParent, aParent, zBr, zBgClr,
+                           zUuid, isLeaf);
       db_reset(&qbranch);
-      @ <div id="m%d(gidx)"></div>
+      @ <div id="m%d(gidx)" class="tl-nodemark"></div>
     }
     @</td>
-    if( zBgClr && zBgClr[0] ){
+    if( zBgClr && zBgClr[0] && rid!=selectedRid ){
       @ <td class="timelineTableCell" style="background-color: %h(zBgClr);">
     }else{
       @ <td class="timelineTableCell">
     }
+    if( pGraph && zType[0]!='c' ){
+      @ &bull;
+    }
+    if( modPending ){
+      @ <span class="modpending">(Awaiting Moderator Approval)</span>
+    }
     if( zType[0]=='c' ){
+      if( tmFlags & TIMELINE_BISECT ){
+        static Stmt bisectQuery;
+        db_prepare(&bisectQuery, "SELECT seq, stat FROM bilog WHERE rid=:rid");
+        db_bind_int(&bisectQuery, ":rid", rid);
+        if( db_step(&bisectQuery)==SQLITE_ROW ){
+          @ <b>%s(db_column_text(&bisectQuery,1))</b>
+          @ (%d(db_column_int(&bisectQuery,0)))
+        }
+        db_reset(&bisectQuery);
+      }
       hyperlink_to_uuid(zUuid);
       if( isLeaf ){
         if( db_exists("SELECT 1 FROM tagxref"
@@ -291,37 +426,184 @@ void www_print_timeline(
         }
       }
     }else if( zType[0]=='e' && tagid ){
-      hyperlink_to_event_tagid(tagid);
+      hyperlink_to_event_tagid(tagid<0?-tagid:tagid);
     }else if( (tmFlags & TIMELINE_ARTID)!=0 ){
       hyperlink_to_uuid(zUuid);
     }
+    if( tmFlags & TIMELINE_SHOWRID ){
+      @ (%d(rid))
+    }
     db_column_blob(pQuery, commentColumn, &comment);
-    if( mxWikiLen>0 && blob_size(&comment)>mxWikiLen ){
+    if( zType[0]!='c' ){
+      /* Comments for anything other than a check-in are generated by
+      ** "fossil rebuild" and expect to be rendered as text/x-fossil-wiki */
+      wiki_convert(&comment, 0, WIKI_INLINE);
+    }else if( bCommentGitStyle ){
+      /* Truncate comment at first blank line */
+      int ii, jj;
+      int n = blob_size(&comment);
+      char *z = blob_str(&comment);
+      for(ii=0; ii<n; ii++){
+        if( z[ii]=='\n' ){
+          for(jj=ii+1; jj<n && z[jj]!='\n' && fossil_isspace(z[jj]); jj++){}
+          if( z[jj]=='\n' ) break;
+        }
+      }
+      z[ii] = 0;
+      @ <span class="timelineComment">%W(z)</span>
+    }else if( mxWikiLen>0 && blob_size(&comment)>mxWikiLen ){
       Blob truncated;
       blob_zero(&truncated);
       blob_append(&truncated, blob_buffer(&comment), mxWikiLen);
       blob_append(&truncated, "...", 3);
-      wiki_convert(&truncated, 0, wikiFlags);
+      @ <span class="timelineComment">%W(blob_str(&truncated))</span>
       blob_reset(&truncated);
     }else{
-      wiki_convert(&comment, 0, wikiFlags);
+      @ <span class="timelineComment">%W(blob_str(&comment))</span>
     }
     blob_reset(&comment);
-    if( zTagList && zTagList[0] ){
-      @ (user: %h(zUser), tags: %h(zTagList))
+
+    /* Generate the "user: USERNAME" at the end of the comment, together
+    ** with a hyperlink to another timeline for that user.
+    */
+    if( zTagList && zTagList[0]==0 ) zTagList = 0;
+    if( g.perm.Hyperlink && fossil_strcmp(zDispUser, zThisUser)!=0 ){
+      char *zLink = mprintf("%R/timeline?u=%h&c=%t&nd&n=200", zDispUser, zDate);
+      @ (user: %z(href("%z",zLink))%h(zDispUser)</a>%s(zTagList?",":"\051")
     }else{
-      @ (user: %h(zUser))
+      @ (user: %h(zDispUser)%s(zTagList?",":"\051")
     }
+
+    /* Generate a "detail" link for tags. */
+    if( (zType[0]=='g' || zType[0]=='w' || zType[0]=='t') && g.perm.Hyperlink ){
+      @ [%z(href("%R/info/%!S",zUuid))details</a>]
+    }
+
+    /* Generate the "tags: TAGLIST" at the end of the comment, together
+    ** with hyperlinks to the tag list.
+    */
+    if( zTagList ){
+      if( g.perm.Hyperlink ){
+        int i;
+        const char *z = zTagList;
+        Blob links;
+        blob_zero(&links);
+        while( z && z[0] ){
+          for(i=0; z[i] && (z[i]!=',' || z[i+1]!=' '); i++){}
+          if( zThisTag==0 || memcmp(z, zThisTag, i)!=0 || zThisTag[i]!=0 ){
+            blob_appendf(&links,
+                  "%z%#h</a>%.2s",
+                  href("%R/timeline?r=%#t&nd&c=%t&n=200",i,z,zDate), i,z, &z[i]
+            );
+          }else{
+            blob_appendf(&links, "%#h", i+2, z);
+          }
+          if( z[i]==0 ) break;
+          z += i+2;
+        }
+        @ tags: %s(blob_str(&links)))
+        blob_reset(&links);
+      }else{
+        @ tags: %h(zTagList))
+      }
+    }
+    tag_private_status(rid);
+
+    /* Generate extra hyperlinks at the end of the comment */
     if( xExtra ){
       xExtra(rid);
     }
-    @ </td></tr>
+
+    /* Generate the file-change list if requested */
+    if( (tmFlags & (TIMELINE_FCHANGES|TIMELINE_FRENAMES))!=0
+     && zType[0]=='c' && g.perm.Hyperlink
+    ){
+      int inUl = 0;
+      if( !fchngQueryInit ){
+        db_prepare(&fchngQuery,
+          "SELECT pid,"
+          "       fid,"
+          "       (SELECT name FROM filename WHERE fnid=mlink.fnid) AS name,"
+          "       (SELECT uuid FROM blob WHERE rid=fid),"
+          "       (SELECT uuid FROM blob WHERE rid=pid),"
+          "       (SELECT name FROM filename WHERE fnid=mlink.pfnid) AS oldnm"
+          "  FROM mlink"
+          " WHERE mid=:mid AND (pid!=fid OR pfnid>0)"
+          "   AND (fid>0 OR"
+               "   fnid NOT IN (SELECT pfnid FROM mlink WHERE mid=:mid))"
+          "   AND NOT mlink.isaux"
+          " ORDER BY 3 /*sort*/"
+        );
+        fchngQueryInit = 1;
+      }
+      db_bind_int(&fchngQuery, ":mid", rid);
+      while( db_step(&fchngQuery)==SQLITE_ROW ){
+        const char *zFilename = db_column_text(&fchngQuery, 2);
+        int isNew = db_column_int(&fchngQuery, 0)<=0;
+        int isMergeNew = db_column_int(&fchngQuery, 0)<0;
+        int fid = db_column_int(&fchngQuery, 1);
+        int isDel = fid==0;
+        const char *zOldName = db_column_text(&fchngQuery, 5);
+        const char *zOld = db_column_text(&fchngQuery, 4);
+        const char *zNew = db_column_text(&fchngQuery, 3);
+        const char *zUnpub = "";
+        char *zA;
+        char zId[20];
+        if( !inUl ){
+          @ <ul class="filelist">
+          inUl = 1;
+        }
+        if( tmFlags & TIMELINE_SHOWRID ){
+          sqlite3_snprintf(sizeof(zId), zId, " (%d) ", fid);
+        }else{
+          zId[0] = 0;
+        }
+        if( (tmFlags & TIMELINE_FRENAMES)!=0 ){
+          if( !isNew && !isDel && zOldName!=0 ){
+            @ <li> %h(zOldName) &rarr; %h(zFilename)%s(zId)
+          }
+          continue;
+        }
+        zA = href("%R/artifact/%!S",fid?zNew:zOld);
+        if( content_is_private(fid) ){
+          zUnpub =  UNPUB_TAG;
+        }
+        if( isNew ){
+          @ <li> %s(zA)%h(zFilename)</a>%s(zId) %s(zUnpub)
+          if( isMergeNew ){
+            @ (added by merge)
+          }else{
+            @ (new file)
+          }
+          @ &nbsp; %z(href("%R/artifact/%!S",zNew))[view]</a></li>
+        }else if( isDel ){
+          @ <li> %s(zA)%h(zFilename)</a> (deleted)</li>
+        }else if( fossil_strcmp(zOld,zNew)==0 && zOldName!=0 ){
+          @ <li> %h(zOldName) &rarr; %s(zA)%h(zFilename)</a>%s(zId)
+          @ %s(zUnpub) %z(href("%R/artifact/%!S",zNew))[view]</a></li>
+        }else{
+          if( zOldName!=0 ){
+            @ <li>%h(zOldName) &rarr; %s(zA)%h(zFilename)%s(zId)</a> %s(zUnpub)
+          }else{
+            @ <li>%s(zA)%h(zFilename)</a>%s(zId) &nbsp; %s(zUnpub)
+          }
+          @ %z(href("%R/fdiff?sbs=1&v1=%!S&v2=%!S",zOld,zNew))[diff]</a></li>
+        }
+        fossil_free(zA);
+      }
+      db_reset(&fchngQuery);
+      if( inUl ){
+        @ </ul>
+      }
+    }
   }
   if( suppressCnt ){
-    @ <tr><td /><td /><td>
     @ <span class="timelineDisabled">... %d(suppressCnt) similar
-    @ event%s(suppressCnt>1?"s":"") omitted.</span></td></tr>
+    @ event%s(suppressCnt>1?"s":"") omitted.</span>
     suppressCnt = 0;
+  }
+  if( pendingEndTr ){
+    @ </td></tr>
   }
   if( pGraph ){
     graph_finish(pGraph, (tmFlags & TIMELINE_DISJOINT)!=0);
@@ -329,82 +611,235 @@ void www_print_timeline(
       graph_free(pGraph);
       pGraph = 0;
     }else{
-      /* style is not moved to css, because this is
-      ** a technical div for the timeline graph
-      */
-      @ <tr><td /><td>
-      @ <div id="grbtm" style="width:%d(pGraph->mxRail*20+30)px;"></div>
-      @ </td></tr>
+      @ <tr class="timelineBottom"><td></td><td></td><td></td></tr>
     }
   }
   @ </table>
-  timeline_output_graph_javascript(pGraph);
+  if( fchngQueryInit ) db_finalize(&fchngQuery);
+  timeline_output_graph_javascript(pGraph, (tmFlags & TIMELINE_DISJOINT)!=0, 0);
+}
+
+/*
+** Change the RGB background color given in the argument in a foreground
+** color with the same hue.
+*/
+static const char *bg_to_fg(const char *zIn){
+  int i;
+  unsigned int x[3];
+  unsigned int mx = 0;
+  static int whiteFg = -1;
+  static char zRes[10];
+  if( strlen(zIn)!=7 || zIn[0]!='#' ) return zIn;
+  zIn++;
+  for(i=0; i<3; i++){
+    x[i] = hex_digit_value(zIn[0])*16 + hex_digit_value(zIn[1]);
+    zIn += 2;
+    if( x[i]>mx ) mx = x[i];
+  }
+  if( whiteFg<0 ) whiteFg = skin_detail_boolean("white-foreground");
+  if( whiteFg ){
+    /* Make the color lighter */
+    static const unsigned int t = 215;
+    if( mx<t ) for(i=0; i<3; i++) x[i] += t - mx;
+  }else{
+    /* Make the color darker */
+    static const unsigned int t = 128;
+    if( mx>t ) for(i=0; i<3; i++) x[i] -= mx - t;
+  }
+  sqlite3_snprintf(sizeof(zRes),zRes,"#%02x%02x%02x",x[0],x[1],x[2]);
+  return zRes;
 }
 
 /*
 ** Generate all of the necessary javascript to generate a timeline
 ** graph.
 */
-void timeline_output_graph_javascript(GraphContext *pGraph){
-  if( pGraph && pGraph->nErr==0 ){
+void timeline_output_graph_javascript(
+  GraphContext *pGraph,     /* The graph to be displayed */
+  int omitDescenders,       /* True to omit descenders */
+  int fileDiff              /* True for file diff.  False for check-in diff */
+){
+  if( pGraph && pGraph->nErr==0 && pGraph->nRow>0 ){
     GraphRow *pRow;
     int i;
     char cSep;
-    @ <script  type="text/JavaScript">
-    @ /* <![CDATA[ */
+    int iRailPitch;      /* Pixels between consecutive rails */
+    int showArrowheads;  /* True to draw arrowheads.  False to omit. */
+    int circleNodes;     /* True for circle nodes.  False for square nodes */
+    int colorGraph;      /* Use colors for graph lines */
+
+    iRailPitch = atoi(PD("railpitch","0"));
+    showArrowheads = skin_detail_boolean("timeline-arrowheads");
+    circleNodes = skin_detail_boolean("timeline-circle-nodes");
+    colorGraph = skin_detail_boolean("timeline-color-graph-lines");
+
+    @ <script>(function(){
+    @ "use strict";
+    @ var css = "";
+    if( circleNodes ){
+      @ css += ".tl-node, .tl-node:after { border-radius: 50%%; }";
+    }
+    if( !showArrowheads ){
+      @ css += ".tl-arrow.u { display: none; }";
+    }
+    @ if( css!=="" ){
+    @   var style = document.createElement("style");
+    @   style.textContent = css;
+    @   document.querySelector("head").appendChild(style);
+    @ }
+    /* the rowinfo[] array contains all the information needed to generate
+    ** the graph.  Each entry contains information for a single row:
+    **
+    **   id:  The id of the <div> element for the row. This is an integer.
+    **        to get an actual id, prepend "m" to the integer.  The top node
+    **        is 1 and numbers increase moving down the timeline.
+    **   bg:  The background color for this row
+    **    r:  The "rail" that the node for this row sits on.  The left-most
+    **        rail is 0 and the number increases to the right.
+    **    d:  True if there is a "descender" - an arrow coming from the bottom
+    **        of the page straight up to this node.
+    **   mo:  "merge-out".  If non-negative, this is the rail position
+    **        for the upward portion of a merge arrow.  The merge arrow goes up
+    **        to the row identified by mu:.  If this value is negative then
+    **        node has no merge children and no merge-out line is drawn.
+    **   mu:  The id of the row which is the top of the merge-out arrow.
+    **    u:  Draw a thick child-line out of the top of this node and up to
+    **        the node with an id equal to this value.  0 if it is straight to
+    **        the top of the page, -1 if there is no thick-line riser.
+    **    f:  0x01: a leaf node.
+    **   au:  An array of integers that define thick-line risers for branches.
+    **        The integers are in pairs.  For each pair, the first integer is
+    **        is the rail on which the riser should run and the second integer
+    **        is the id of the node upto which the riser should run.
+    **   mi:  "merge-in".  An array of integer rail positions from which
+    **        merge arrows should be drawn into this node.  If the value is
+    **        negative, then the rail position is the absolute value of mi[]
+    **        and a thin merge-arrow descender is drawn to the bottom of
+    **        the screen.
+    **    h:  The SHA1 hash of the object being graphed
+    */
     cgi_printf("var rowinfo = [\n");
     for(pRow=pGraph->pFirst; pRow; pRow=pRow->pNext){
-      cgi_printf("{id:\"m%d\",bg:\"%s\",r:%d,d:%d,mo:%d,mu:%d,u:%d,au:",
-        pRow->idx,
-        pRow->zBgClr,
-        pRow->iRail,
-        pRow->bDescender,
-        pRow->mergeOut,
-        pRow->mergeUpto,
-        pRow->aiRaiser[pRow->iRail]
+      cgi_printf("{id:%d,bg:\"%s\",r:%d,d:%d,mo:%d,mu:%d,u:%d,f:%d,au:",
+        pRow->idx,                      /* id */
+        pRow->zBgClr,                   /* bg */
+        pRow->iRail,                    /* r */
+        pRow->bDescender,               /* d */
+        pRow->mergeOut,                 /* mo */
+        pRow->mergeUpto,                /* mu */
+        pRow->aiRiser[pRow->iRail],     /* u */
+        pRow->isLeaf ? 1 : 0            /* f */
       );
+      /* u */
       cSep = '[';
       for(i=0; i<GR_MAX_RAIL; i++){
         if( i==pRow->iRail ) continue;
-        if( pRow->aiRaiser[i]>0 ){
-          cgi_printf("%c%d,%d", cSep, i, pRow->aiRaiser[i]);
+        if( pRow->aiRiser[i]>0 ){
+          cgi_printf("%c%d,%d", cSep, i, pRow->aiRiser[i]);
           cSep = ',';
         }
       }
       if( cSep=='[' ) cgi_printf("[");
-      cgi_printf("],mi:");
+      cgi_printf("],");
+      if( colorGraph && pRow->zBgClr[0]=='#' ){
+        cgi_printf("fg:\"%s\",", bg_to_fg(pRow->zBgClr));
+      }
+      /* mi */
+      cgi_printf("mi:");
       cSep = '[';
       for(i=0; i<GR_MAX_RAIL; i++){
-        if( pRow->mergeIn & (1<<i) ){
-          cgi_printf("%c%d", cSep, i);
+        if( pRow->mergeIn[i] ){
+          int mi = i;
+          if( pRow->mergeDown & (1<<i) ) mi = -mi;
+          cgi_printf("%c%d", cSep, mi);
           cSep = ',';
         }
       }
       if( cSep=='[' ) cgi_printf("[");
-      cgi_printf("]}%s", pRow->pNext ? ",\n" : "];\n");
+      cgi_printf("],h:\"%!S\"}%s", pRow->zUuid, pRow->pNext ? ",\n" : "];\n");
     }
     cgi_printf("var nrail = %d\n", pGraph->mxRail+1);
     graph_free(pGraph);
-    @ var canvasDiv = document.getElementById("canvas");
-    @ var realCanvas = null;
-    @ function drawBox(color,x0,y0,x1,y1){
+    @ var canvasDiv;
+    @ var railPitch;
+    @ var mergeOffset;
+    @ var node, arrow, arrowSmall, line, mArrow, mLine, wArrow, wLine;
+    @ function initGraph(){
+    @   var parent = gebi("timelineTable").rows[0].cells[1];
+    @   parent.style.verticalAlign = "top";
+    @   canvasDiv = document.createElement("div");
+    @   canvasDiv.className = "tl-canvas";
+    @   canvasDiv.style.position = "absolute";
+    @   parent.appendChild(canvasDiv);
+    @
+    @   var elems = {};
+    @   var elemClasses = [
+    @     "rail", "mergeoffset", "node", "arrow u", "arrow u sm", "line",
+    @     "arrow merge r", "line merge", "arrow warp", "line warp"
+    @   ];
+    @   for( var i=0; i<elemClasses.length; i++ ){
+    @     var cls = elemClasses[i];
+    @     var elem = document.createElement("div");
+    @     elem.className = "tl-" + cls;
+    @     if( cls.indexOf("line")==0 ) elem.className += " v";
+    @     canvasDiv.appendChild(elem);
+    @     var k = cls.replace(/\s/g, "_");
+    @     var r = elem.getBoundingClientRect();
+    @     var w = Math.round(r.right - r.left);
+    @     var h = Math.round(r.bottom - r.top);
+    @     elems[k] = {w: w, h: h, cls: cls};
+    @   }
+    @   node = elems.node;
+    @   arrow = elems.arrow_u;
+    @   arrowSmall = elems.arrow_u_sm;
+    @   line = elems.line;
+    @   mArrow = elems.arrow_merge_r;
+    @   mLine = elems.line_merge;
+    @   wArrow = elems.arrow_warp;
+    @   wLine = elems.line_warp;
+    @
+    @   var minRailPitch = Math.ceil((node.w+line.w)/2 + mArrow.w + 1);
+    if( iRailPitch ){
+      @   railPitch = %d(iRailPitch);
+    }else{
+      @   railPitch = elems.rail.w;
+      @   railPitch -= Math.floor((nrail-1)*(railPitch-minRailPitch)/21);
+    }
+    @   railPitch = Math.max(railPitch, minRailPitch);
+    @
+    if( PB("nomo") ){
+      @   mergeOffset = 0;
+    }else{
+      @   mergeOffset = railPitch-minRailPitch-mLine.w;
+      @   mergeOffset = Math.min(mergeOffset, elems.mergeoffset.w);
+      @   mergeOffset = mergeOffset>0 ? mergeOffset + line.w/2 : 0;
+    }
+    @
+    @   var canvasWidth = (nrail-1)*railPitch + node.w;
+    @   canvasDiv.style.width = canvasWidth + "px";
+    @   canvasDiv.style.position = "relative";
+    @ }
+    @ function drawBox(cls,color,x0,y0,x1,y1){
     @   var n = document.createElement("div");
+    @   x0 = Math.floor(x0);
+    @   y0 = Math.floor(y0);
+    @   x1 = x1 || x1===0 ? Math.floor(x1) : x0;
+    @   y1 = y1 || y1===0 ? Math.floor(y1) : y0;
     @   if( x0>x1 ){ var t=x0; x0=x1; x1=t; }
     @   if( y0>y1 ){ var t=y0; y0=y1; y1=t; }
-    @   var w = x1-x0+1;
-    @   var h = y1-y0+1;
+    @   var w = x1-x0;
+    @   var h = y1-y0;
     @   n.style.position = "absolute";
-    @   n.style.overflow = "hidden";
     @   n.style.left = x0+"px";
     @   n.style.top = y0+"px";
-    @   n.style.width = w+"px";
-    @   n.style.height = h+"px";
-    @   n.style.backgroundColor = color;
+    @   if( w ) n.style.width = w+"px";
+    @   if( h ) n.style.height = h+"px";
+    @   if( color ) n.style.backgroundColor = color;
+    @   n.className = "tl-"+cls;
     @   canvasDiv.appendChild(n);
+    @   return n;
     @ }
-    @ function absoluteY(id){
-    @   var obj = document.getElementById(id);
-    @   if( !obj ) return;
+    @ function absoluteY(obj){
     @   var top = 0;
     @   if( obj.offsetParent ){
     @     do{
@@ -413,128 +848,171 @@ void timeline_output_graph_javascript(GraphContext *pGraph){
     @   }
     @   return top;
     @ }
-    @ function absoluteX(id){
-    @   var obj = document.getElementById(id);
-    @   if( !obj ) return;
-    @   var left = 0;
-    @   if( obj.offsetParent ){
-    @     do{
-    @       left += obj.offsetLeft;
-    @     }while( obj = obj.offsetParent );
-    @   }
-    @   return left;
+    @ function miLineY(p){
+    @   return p.y + node.h - mLine.w - 1;
     @ }
-    @ function drawUpArrow(x,y0,y1){
-    @   drawBox("black",x,y0,x+1,y1);
-    @   if( y0+8>=y1 ){
-    @     drawBox("black",x-1,y0+1,x+2,y0+2);
-    @     drawBox("black",x-2,y0+3,x+3,y0+4);
+    @ function drawLine(elem,color,x0,y0,x1,y1){
+    @   var cls = elem.cls + " ";
+    @   if( x1===null ){
+    @     x1 = x0+elem.w;
+    @     cls += "v";
     @   }else{
-    @     drawBox("black",x-1,y0+2,x+2,y0+4);
-    @     drawBox("black",x-2,y0+5,x+3,y0+7);
+    @     y1 = y0+elem.w;
+    @     cls += "h";
     @   }
+    @   drawBox(cls,color,x0,y0,x1,y1);
     @ }
-    @ function drawThinArrow(y,xFrom,xTo){
-    @   if( xFrom<xTo ){
-    @     drawBox("black",xFrom,y,xTo,y);
-    @     drawBox("black",xTo-4,y-1,xTo-2,y+1);
-    @     if( xTo>xFrom-8 ) drawBox("black",xTo-6,y-2,xTo-5,y+2);
+    @ function drawUpArrow(from,to,color){
+    @   var y = to.y + node.h;
+    @   var arrowSpace = from.y - y + (!from.id || from.r!=to.r ? node.h/2 : 0);
+    @   var arw = arrowSpace < arrow.h*1.5 ? arrowSmall : arrow;
+    @   var x = to.x + (node.w-line.w)/2;
+    @   var y0 = from.y + node.h/2;
+    @   var y1 = Math.ceil(to.y + node.h + arw.h/2);
+    @   drawLine(line,color,x,y0,null,y1);
+    @   x = to.x + (node.w-arw.w)/2;
+    @   var n = drawBox(arw.cls,null,x,y);
+    @   n.style.borderBottomColor = color;
+    @ }
+    @ function drawMergeLine(x0,y0,x1,y1){
+    @   drawLine(mLine,null,x0,y0,x1,y1);
+    @ }
+    @ function drawMergeArrow(p,rail){
+    @   var x0 = rail*railPitch + node.w/2;
+    @   if( rail in mergeLines ){
+    @     x0 += mergeLines[rail];
+    @     if( p.r<rail ) x0 += mLine.w;
     @   }else{
-    @     drawBox("black",xTo,y,xFrom,y);
-    @     drawBox("black",xTo+2,y-1,xTo+4,y+1);
-    @     if( xTo+8<xFrom ) drawBox("black",xTo+5,y-2,xTo+6,y+2);
+    @     x0 += (p.r<rail ? -1 : 1)*line.w/2;
     @   }
+    @   var x1 = mArrow.w ? mArrow.w/2 : -node.w/2;
+    @   x1 = p.x + (p.r<rail ? node.w + Math.ceil(x1) : -x1);
+    @   var y = miLineY(p);
+    @   drawMergeLine(x0,y,x1,null);
+    @   var x = p.x + (p.r<rail ? node.w : -mArrow.w);
+    @   var cls = "arrow merge " + (p.r<rail ? "l" : "r");
+    @   drawBox(cls,null,x,y+(mLine.w-mArrow.h)/2);
     @ }
-    @ function drawThinLine(x0,y0,x1,y1){
-    @   drawBox("black",x0,y0,x1,y1);
-    @ }
-    @ function drawNode(p, left, btm){
-    @   drawBox("black",p.x-5,p.y-5,p.x+6,p.y+6);
-    @   drawBox(p.bg,p.x-4,p.y-4,p.x+5,p.y+5);
-    @   if( p.u>0 ){
-    @     var u = rowinfo[p.u-1];
-    @     drawUpArrow(p.x, u.y+6, p.y-5);
-    @   }
-    @   if( p.d ){
-    @     drawUpArrow(p.x, p.y+6, btm);
-    @   } 
+    @ function drawNode(p, btm){
+    @   if( p.u>0 ) drawUpArrow(p,rowinfo[p.u-1],p.fg);
+    @   var cls = node.cls;
+    @   if( p.mi.length ) cls += " merge";
+    @   if( p.f&1 ) cls += " leaf";
+    @   var n = drawBox(cls,p.bg,p.x,p.y);
+    @   n.id = "tln"+p.id;
+    @   n.onclick = clickOnNode;
+    @   n.style.zIndex = 10;
+    if( !omitDescenders ){
+      @   if( p.u==0 ) drawUpArrow(p,{x: p.x, y: -node.h},p.fg);
+      @   if( p.d ) drawUpArrow({x: p.x, y: btm-node.h/2},p,p.fg);
+    }
     @   if( p.mo>=0 ){
-    @     var x1 = p.mo*20 + left;
-    @     var y1 = p.y-3;
-    @     var x0 = x1>p.x ? p.x+7 : p.x-6;
+    @     var x0 = p.x + node.w/2;
+    @     var x1 = p.mo*railPitch + node.w/2;
     @     var u = rowinfo[p.mu-1];
-    @     var y0 = u.y+5;
-    @     drawThinLine(x0,y1,x1,y1);
-    @     drawThinLine(x1,y0,x1,y1);
-    @   }
-    @   var n = p.au.length;
-    @   for(var i=0; i<n; i+=2){
-    @     var x1 = p.au[i]*20 + left;
-    @     var x0 = x1>p.x ? p.x+7 : p.x-6;
-    @     drawBox("black",x0,p.y,x1,p.y+1);
-    @     var u = rowinfo[p.au[i+1]-1];
-    @     drawUpArrow(x1, u.y+6, p.y);
-    @   }
-    @   for(var j in p.mi){
-    @     var y0 = p.y+5;
-    @     var mx = p.mi[j]*20 + left;
-    @     if( mx>p.x ){
-    @       drawThinArrow(y0,mx,p.x+5);
+    @     var y1 = miLineY(u);
+    @     if( p.u<0 || p.mo!=p.r ){
+    @       x1 += mergeLines[p.mo] = -mLine.w/2;
+    @       var y0 = p.y+2;
+    @       if( p.r!=p.mo ) drawMergeLine(x0,y0,x1+(x0<x1 ? mLine.w : 0),null);
+    @       drawMergeLine(x1,y0+mLine.w,null,y1);
+    @     }else if( mergeOffset ){
+    @       mergeLines[p.mo] = u.r<p.r ? -mergeOffset-mLine.w : mergeOffset;
+    @       x1 += mergeLines[p.mo];
+    @       drawMergeLine(x1,p.y+node.h/2,null,y1);
     @     }else{
-    @       drawThinArrow(y0,mx,p.x-5);
+    @       delete mergeLines[p.mo];
     @     }
     @   }
+    @   for( var i=0; i<p.au.length; i+=2 ){
+    @     var rail = p.au[i];
+    @     var x0 = p.x + node.w/2;
+    @     var x1 = rail*railPitch + (node.w-line.w)/2;
+    @     if( x0<x1 ){
+    @       x0 = Math.ceil(x0);
+    @       x1 += line.w;
+    @     }
+    @     var y0 = p.y + (node.h-line.w)/2;
+    @     var u = rowinfo[p.au[i+1]-1];
+    @     if( u.id<p.id ){
+    @       drawLine(line,u.fg,x0,y0,x1,null);
+    @       drawUpArrow(p,u,u.fg);
+    @     }else{
+    @       var y1 = u.y + (node.h-line.w)/2;
+    @       drawLine(wLine,u.fg,x0,y0,x1,null);
+    @       drawLine(wLine,u.fg,x1-line.w,y0,null,y1+line.w);
+    @       drawLine(wLine,u.fg,x1,y1,u.x-wArrow.w/2,null);
+    @       var x = u.x-wArrow.w;
+    @       var y = u.y+(node.h-wArrow.h)/2;
+    @       var n = drawBox(wArrow.cls,null,x,y);
+    @       if( u.fg ) n.style.borderLeftColor = u.fg;
+    @     }
+    @   }
+    @   for( var i=0; i<p.mi.length; i++ ){
+    @     var rail = p.mi[i];
+    @     if( rail<0 ){
+    @       rail = -rail;
+    @       mergeLines[rail] = -mLine.w/2;
+    @       var x = rail*railPitch + (node.w-mLine.w)/2;
+    @       drawMergeLine(x,miLineY(p),null,btm);
+    @     }
+    @     drawMergeArrow(p,rail);
+    @   }
     @ }
+    @ var mergeLines;
     @ function renderGraph(){
-    @   var canvasDiv = document.getElementById("canvas");
-    @   while( canvasDiv.hasChildNodes() ){
-    @     canvasDiv.removeChild(canvasDiv.firstChild);
+    @   mergeLines = {};
+    @   canvasDiv.innerHTML = "";
+    @   var canvasY = absoluteY(canvasDiv);
+    @   for( var i=0; i<rowinfo.length; i++ ){
+    @     rowinfo[i].y = absoluteY(gebi("m"+rowinfo[i].id)) - canvasY;
+    @     rowinfo[i].x = rowinfo[i].r*railPitch;
     @   }
-    @   var canvasY = absoluteY("canvas");
-    @   var left = absoluteX(rowinfo[0].id) - absoluteX("canvas") + 15;
-    @   var width = nrail*20;
-    @   for(var i in rowinfo){
-    @     rowinfo[i].y = absoluteY(rowinfo[i].id) + 10 - canvasY;
-    @     rowinfo[i].x = left + rowinfo[i].r*20;
+    @   var tlBtm = document.querySelector(".timelineBottom");
+    @   if( tlBtm.offsetHeight<node.h ){
+    @     tlBtm.style.height = node.h + "px";
     @   }
-    @   var btm = absoluteY("grbtm") + 10 - canvasY;
-    @   if( btm<32768 ){
-    @     canvasDiv.innerHTML = '<canvas id="timeline-canvas" '+
-    @        'style="position:absolute;left:'+(left-5)+'px;"' +
-    @        ' width="'+width+'" height="'+btm+'"><'+'/canvas>';
-    @     realCanvas = document.getElementById('timeline-canvas');
-    @   }else{
-    @     realCanvas = 0;
-    @   }
-    @   var context;
-    @   if( realCanvas && realCanvas.getContext
-    @        && (context = realCanvas.getContext('2d'))) {
-    @     drawBox = function(color,x0,y0,x1,y1) {
-    @       if( y0>32767 || y1>32767 ) return;
-    @       if( x0>x1 ){ var t=x0; x0=x1; x1=t; }
-    @       if( y0>y1 ){ var t=y0; y0=y1; y1=t; }
-    @       if(isNaN(x0) || isNaN(y0) || isNaN(x1) || isNaN(y1)) return;
-    @       context.fillStyle = color;
-    @       context.fillRect(x0-left+5,y0,x1-x0+1,y1-y0+1);
-    @     };
-    @   }
-    @   for(var i in rowinfo){
-    @     drawNode(rowinfo[i], left, btm);
+    @   var btm = absoluteY(tlBtm) - canvasY + tlBtm.offsetHeight;
+    @   for( var i=rowinfo.length-1; i>=0; i-- ){
+    @     drawNode(rowinfo[i], btm);
     @   }
     @ }
-    @ var lastId = rowinfo[rowinfo.length-1].id;
+    @ var selRow;
+    @ function clickOnNode(){
+    @   var p = rowinfo[parseInt(this.id.match(/\d+$/)[0], 10)-1];
+    @   if( !selRow ){
+    @     selRow = p;
+    @     this.className += " sel";
+    @     canvasDiv.className += " sel";
+    @   }else if( selRow==p ){
+    @     selRow = null;
+    @     this.className = this.className.replace(" sel", "");
+    @     canvasDiv.className = canvasDiv.className.replace(" sel", "");
+    @   }else{
+    if( fileDiff ){
+      @     location.href="%R/fdiff?v1="+selRow.h+"&v2="+p.h+"&sbs=1";
+    }else{
+      if( db_get_boolean("show-version-diffs", 0)==0 ){
+        @     location.href="%R/vdiff?from="+selRow.h+"&to="+p.h+"&sbs=0";
+      }else{
+        @     location.href="%R/vdiff?from="+selRow.h+"&to="+p.h+"&sbs=1";
+      }
+    }
+    @   }
+    @ }
+    @ var lastRow = gebi("m"+rowinfo[rowinfo.length-1].id);
     @ var lastY = 0;
     @ function checkHeight(){
-    @   var h = absoluteY(lastId);
+    @   var h = absoluteY(lastRow);
     @   if( h!=lastY ){
     @     renderGraph();
     @     lastY = h;
     @   }
-    @   setTimeout("checkHeight();", 1000);
+    @   setTimeout(checkHeight, 1000);
     @ }
+    @ initGraph();
     @ checkHeight();
-    @ /* ]]> */
-    @ </script>
+    @ }())</script>
   }
 }
 
@@ -542,7 +1020,7 @@ void timeline_output_graph_javascript(GraphContext *pGraph){
 ** Create a temporary table suitable for storing timeline data.
 */
 static void timeline_temp_table(void){
-  static const char zSql[] = 
+  static const char zSql[] =
     @ CREATE TEMP TABLE IF NOT EXISTS timeline(
     @   rid INTEGER PRIMARY KEY,
     @   uuid TEXT,
@@ -554,10 +1032,11 @@ static void timeline_temp_table(void){
     @   etype TEXT,
     @   taglist TEXT,
     @   tagid INTEGER,
-    @   short TEXT
+    @   short TEXT,
+    @   sortby REAL
     @ )
   ;
-  db_multi_exec(zSql);
+  db_multi_exec("%s", zSql/*safe-for-%s*/);
 }
 
 /*
@@ -565,33 +1044,25 @@ static void timeline_temp_table(void){
 ** for a timeline query for the WWW interface.
 */
 const char *timeline_query_for_www(void){
-  static char *zBase = 0;
-  static const char zBaseSql[] =
+  static const char zBase[] =
     @ SELECT
-    @   blob.rid,
-    @   uuid,
-    @   datetime(event.mtime,'localtime') AS timestamp,
-    @   coalesce(ecomment, comment),
-    @   coalesce(euser, user),
-    @   NOT EXISTS(SELECT 1 FROM plink
-    @               WHERE pid=blob.rid
-    @                AND coalesce((SELECT value FROM tagxref
-    @                              WHERE tagid=%d AND rid=plink.pid), 'trunk')
-    @                  = coalesce((SELECT value FROM tagxref
-    @                              WHERE tagid=%d AND rid=plink.cid), 'trunk')),
-    @   bgcolor,
-    @   event.type,
+    @   blob.rid AS blobRid,
+    @   uuid AS uuid,
+    @   datetime(event.mtime,toLocal()) AS timestamp,
+    @   coalesce(ecomment, comment) AS comment,
+    @   coalesce(euser, user) AS user,
+    @   blob.rid IN leaf AS leaf,
+    @   bgcolor AS bgColor,
+    @   event.type AS eventType,
     @   (SELECT group_concat(substr(tagname,5), ', ') FROM tag, tagxref
     @     WHERE tagname GLOB 'sym-*' AND tag.tagid=tagxref.tagid
-    @       AND tagxref.rid=blob.rid AND tagxref.tagtype>0),
-    @   tagid,
-    @   brief
-    @  FROM event JOIN blob 
+    @       AND tagxref.rid=blob.rid AND tagxref.tagtype>0) AS tags,
+    @   tagid AS tagid,
+    @   brief AS brief,
+    @   event.mtime AS mtime
+    @  FROM event CROSS JOIN blob
     @ WHERE blob.rid=event.objid
   ;
-  if( zBase==0 ){
-    zBase = mprintf(zBaseSql, TAG_BRANCH, TAG_BRANCH);
-  }
   return zBase;
 }
 
@@ -611,87 +1082,322 @@ static void timeline_submenu(
 
 
 /*
-** zDate is a localtime date.  Insert records into the
-** "timeline" table to cause <hr> to be inserted before and after
-** entries of that date.
+** Convert a symbolic name used as an argument to the a=, b=, or c=
+** query parameters of timeline into a julianday mtime value.
 */
-static void timeline_add_dividers(const char *zDate){
-  db_multi_exec(
-    "INSERT INTO timeline(rid,timestamp,etype)"
-    "VALUES(-1,datetime(%Q,'-1 second') || '.9','div')",
-    zDate
-  );
-  db_multi_exec(
-    "INSERT INTO timeline(rid,timestamp,etype)"
-    "VALUES(-2,datetime(%Q) || '.1','div')",
-     zDate
-  );
+double symbolic_name_to_mtime(const char *z){
+  double mtime;
+  int rid;
+  if( z==0 ) return -1.0;
+  if( fossil_isdate(z) ){
+    mtime = db_double(0.0, "SELECT julianday(%Q,fromLocal())", z);
+    if( mtime>0.0 ) return mtime;
+  }
+  rid = symbolic_name_to_rid(z, "*");
+  if( rid ){
+    mtime = db_double(0.0, "SELECT mtime FROM event WHERE objid=%d", rid);
+  }else{
+    mtime = db_double(-1.0,
+        "SELECT max(event.mtime) FROM event, tag, tagxref"
+        " WHERE tag.tagname GLOB 'event-%q*'"
+        "   AND tagxref.tagid=tag.tagid AND tagxref.tagtype"
+        "   AND event.objid=tagxref.rid",
+        z
+    );
+  }
+  return mtime;
 }
 
+/*
+** zDate is a localtime date.  Insert records into the
+** "timeline" table to cause <hr> to be inserted on zDate.
+*/
+static int timeline_add_divider(double rDate){
+  int rid = db_int(-1,
+    "SELECT rid FROM timeline ORDER BY abs(sortby-%.16g) LIMIT 1", rDate
+  );
+  if( rid>0 ) return rid;
+  db_multi_exec(
+    "INSERT INTO timeline(rid,sortby,etype) VALUES(-1,%.16g,'div')",
+    rDate
+  );
+  return -1;
+}
+
+/*
+** Return all possible names for file zUuid.
+*/
+char *names_of_file(const char *zUuid){
+  Stmt q;
+  Blob out;
+  const char *zSep = "";
+  db_prepare(&q,
+    "SELECT DISTINCT filename.name FROM mlink, filename"
+    " WHERE mlink.fid=(SELECT rid FROM blob WHERE uuid=%Q)"
+    "   AND filename.fnid=mlink.fnid",
+    zUuid
+  );
+  blob_zero(&out);
+  while( db_step(&q)==SQLITE_ROW ){
+    const char *zFN = db_column_text(&q, 0);
+    blob_appendf(&out, "%s%z%h</a>", zSep,
+          href("%R/finfo?name=%t", zFN), zFN);
+    zSep = " or ";
+  }
+  db_finalize(&q);
+  return blob_str(&out);
+}
+
+
+/*
+** Add the select/option box to the timeline submenu that is used to
+** set the y= parameter that determines which elements to display
+** on the timeline.
+*/
+static void timeline_y_submenu(int isDisabled){
+  static int i = 0;
+  static const char *az[12];
+  if( i==0 ){
+    az[0] = "all";
+    az[1] = "Any Type";
+    i = 2;
+    if( g.perm.Read ){
+      az[i++] = "ci";
+      az[i++] = "Check-ins";
+      az[i++] = "g";
+      az[i++] = "Tags";
+    }
+    if( g.perm.RdWiki ){
+      az[i++] = "e";
+      az[i++] = "Tech Notes";
+    }
+    if( g.perm.RdTkt ){
+      az[i++] = "t";
+      az[i++] = "Tickets";
+    }
+    if( g.perm.RdWiki ){
+      az[i++] = "w";
+      az[i++] = "Wiki";
+    }
+    assert( i<=ArraySize(az) );
+  }
+  if( i>2 ){
+    style_submenu_multichoice("y", i/2, az, isDisabled);
+  }
+}
 
 /*
 ** WEBPAGE: timeline
 **
 ** Query parameters:
 **
-**    a=TIMESTAMP    after this date
-**    b=TIMESTAMP    before this date.
-**    c=TIMESTAMP    "circa" this date.
-**    n=COUNT        number of events in output
-**    p=RID          artifact RID and up to COUNT parents and ancestors
-**    d=RID          artifact RID and up to COUNT descendants
+**    a=TIMEORTAG    after this event
+**    b=TIMEORTAG    before this event
+**    c=TIMEORTAG    "circa" this event
+**    m=TIMEORTAG    mark this event
+**    n=COUNT        max number of events in output
+**    p=UUID         artifact and up to COUNT parents and ancestors
+**    d=UUID         artifact and up to COUNT descendants
+**    dp=UUID        The same as d=UUID&p=UUID
 **    t=TAGID        show only check-ins with the given tagid
 **    r=TAGID        show check-ins related to tagid
 **    u=USER         only if belonging to this user
-**    y=TYPE         'ci', 'w', 't', 'e'
+**    y=TYPE         'ci', 'w', 't', 'e', or (default) 'all'
 **    s=TEXT         string search (comment and brief)
 **    ng             Suppress the graph if present
+**    nd             Suppress "divider" lines
+**    v              Show details of files changed
+**    f=UUID         Show family (immediate parents and children) of UUID
+**    from=UUID      Path from...
+**    to=UUID          ... to this
+**    shortest         ... show only the shortest path
+**    uf=FUUID       Show only check-ins that use given file version
+**    brbg           Background color from branch name
+**    ubg            Background color from user
+**    namechng       Show only check-ins that filename changes
+**    forks          Show only forks and their children
+**    ym=YYYY-MM     Show only events for the given year/month.
+**    ymd=YYYY-MM-DD Show only events on the given day
+**    datefmt=N      Override the date format
+**    bisect         Show the check-ins that are in the current bisect    
 **
 ** p= and d= can appear individually or together.  If either p= or d=
 ** appear, then u=, y=, a=, and b= are ignored.
 **
-** If a= and b= appear, only a= is used.  If neither appear, the most
-** recent events are choosen.
+** If both a= and b= appear then both upper and lower bounds are honored.
 **
-** If n= is missing, the default count is 20.
+** If n= is missing, the default count is 50 for most queries but
+** drops to 11 for c= queries.
 */
 void page_timeline(void){
   Stmt q;                            /* Query used to generate the timeline */
   Blob sql;                          /* text of SQL used to generate timeline */
   Blob desc;                         /* Description of the timeline */
-  int nEntry = atoi(PD("n","20"));   /* Max number of entries on timeline */
-  int p_rid = name_to_rid(P("p"));   /* artifact p and its parents */
-  int d_rid = name_to_rid(P("d"));    /* artifact d and its descendants */
+  int nEntry;                        /* Max number of entries on timeline */
+  int p_rid = name_to_typed_rid(P("p"),"ci");  /* artifact p and its parents */
+  int d_rid = name_to_typed_rid(P("d"),"ci");  /* artifact d and descendants */
+  int f_rid = name_to_typed_rid(P("f"),"ci");  /* artifact f and close family */
   const char *zUser = P("u");        /* All entries by this user if not NULL */
   const char *zType = PD("y","all"); /* Type of events.  All if NULL */
   const char *zAfter = P("a");       /* Events after this time */
   const char *zBefore = P("b");      /* Events before this time */
   const char *zCirca = P("c");       /* Events near this time */
+  const char *zMark = P("m");        /* Mark this event or an event this time */
   const char *zTagName = P("t");     /* Show events with this tag */
   const char *zBrName = P("r");      /* Show events related to this tag */
   const char *zSearch = P("s");      /* Search string */
-  HQuery url;                        /* URL for various branch links */
+  const char *zUses = P("uf");       /* Only show check-ins hold this file */
+  const char *zYearMonth = P("ym");  /* Show check-ins for the given YYYY-MM */
+  const char *zYearWeek = P("yw");   /* Check-ins for YYYY-WW (week-of-year) */
+  const char *zDay = P("ymd");       /* Check-ins for the day YYYY-MM-DD */
+  int useDividers = P("nd")==0;      /* Show dividers if "nd" is missing */
+  int renameOnly = P("namechng")!=0; /* Show only check-ins that rename files */
+  int forkOnly = PB("forks");        /* Show only forks and their children */
+  int bisectOnly = PB("bisect");     /* Show the check-ins of the bisect */
   int tagid;                         /* Tag ID */
-  int tmFlags;                       /* Timeline flags */
+  int tmFlags = 0;                   /* Timeline flags */
+  const char *zThisTag = 0;          /* Suppress links to this tag */
+  const char *zThisUser = 0;         /* Suppress links to this user */
+  HQuery url;                        /* URL for various branch links */
+  int from_rid = name_to_typed_rid(P("from"),"ci"); /* from= for paths */
+  int to_rid = name_to_typed_rid(P("to"),"ci");    /* to= for path timelines */
+  int noMerge = P("shortest")==0;           /* Follow merge links if shorter */
+  int me_rid = name_to_typed_rid(P("me"),"ci");  /* me= for common ancestory */
+  int you_rid = name_to_typed_rid(P("you"),"ci");/* you= for common ancst */
+  int pd_rid;
+  double rBefore, rAfter, rCirca;     /* Boundary times */
+  const char *z;
+  char *zOlderButton = 0;             /* URL for Older button at the bottom */
+  int selectedRid = -9999999;         /* Show a highlight on this RID */
+  int disableY = 0;                   /* Disable type selector on submenu */
+
+  /* Set number of rows to display */
+  z = P("n");
+  if( z ){
+    if( fossil_strcmp(z,"all")==0 ){
+      nEntry = 0;
+    }else{
+      nEntry = atoi(z);
+      if( nEntry<=0 ){
+        cgi_replace_query_parameter("n","10");
+        nEntry = 10;
+      }
+    }
+  }else if( zCirca ){
+    cgi_replace_query_parameter("n","11");
+    nEntry = 11;
+  }else{
+    cgi_replace_query_parameter("n","50");
+    nEntry = 50;
+  }
 
   /* To view the timeline, must have permission to read project data.
   */
+  pd_rid = name_to_typed_rid(P("dp"),"ci");
+  if( pd_rid ){
+    p_rid = d_rid = pd_rid;
+  }
   login_check_credentials();
-  if( !g.okRead && !g.okRdTkt && !g.okRdWiki ){ login_needed(); return; }
-  if( zTagName && g.okRead ){
-    tagid = db_int(0, "SELECT tagid FROM tag WHERE tagname='sym-%q'", zTagName);
-  }else if( zBrName && g.okRead ){
-    tagid = db_int(0, "SELECT tagid FROM tag WHERE tagname='sym-%q'",zBrName);
+  if( (!g.perm.Read && !g.perm.RdTkt && !g.perm.RdWiki)
+   || (bisectOnly && !g.perm.Setup)
+  ){
+    login_needed(g.anon.Read && g.anon.RdTkt && g.anon.RdWiki);
+    return;
+  }
+  url_initialize(&url, "timeline");
+  cgi_query_parameters_to_url(&url);
+  if( zTagName && g.perm.Read ){
+    tagid = db_int(-1,"SELECT tagid FROM tag WHERE tagname='sym-%q'",zTagName);
+    zThisTag = zTagName;
+    style_submenu_element("Related", "Related", "%s",
+                          url_render(&url, "r", zTagName, "t", 0));
+  }else if( zBrName && g.perm.Read ){
+    tagid = db_int(-1,"SELECT tagid FROM tag WHERE tagname='sym-%q'",zBrName);
+    zThisTag = zBrName;
+    style_submenu_element("Branch Only", "only", "%s",
+                          url_render(&url, "t", zBrName, "r", 0));
   }else{
     tagid = 0;
   }
-  if( zType[0]=='a' ){
-    tmFlags = TIMELINE_BRIEF | TIMELINE_GRAPH;
-  }else{
-    tmFlags = TIMELINE_GRAPH;
+  if( zMark && zMark[0]==0 ){
+    if( zAfter ) zMark = zAfter;
+    if( zBefore ) zMark = zBefore;
+    if( zCirca ) zMark = zCirca;
   }
-  if( P("ng")!=0 || zSearch!=0 ){
+  if( tagid
+   && db_int(0,"SELECT count(*) FROM tagxref WHERE tagid=%d",tagid)<=nEntry
+  ){
+    nEntry = -1;
+    zCirca = 0;
+  }
+  if( zType[0]=='a' ){
+    tmFlags |= TIMELINE_BRIEF | TIMELINE_GRAPH;
+  }else{
+    tmFlags |= TIMELINE_GRAPH;
+  }
+  if( PB("ng") || zSearch!=0 ){
     tmFlags &= ~TIMELINE_GRAPH;
+  }
+  if( PB("brbg") ){
+    tmFlags |= TIMELINE_BRCOLOR;
+  }
+  if( PB("unhide") ){
+    tmFlags |= TIMELINE_UNHIDE;
+  }
+  if( PB("ubg") ){
+    tmFlags |= TIMELINE_UCOLOR;
+  }
+  if( zUses!=0 ){
+    int ufid = db_int(0, "SELECT rid FROM blob WHERE uuid GLOB '%q*'", zUses);
+    if( ufid ){
+      zUses = db_text(0, "SELECT uuid FROM blob WHERE rid=%d", ufid);
+      db_multi_exec("CREATE TEMP TABLE usesfile(rid INTEGER PRIMARY KEY)");
+      compute_uses_file("usesfile", ufid, 0);
+      zType = "ci";
+      disableY = 1;
+    }else{
+      zUses = 0;
+    }
+  }
+  if( renameOnly ){
+    db_multi_exec(
+      "CREATE TEMP TABLE rnfile(rid INTEGER PRIMARY KEY);"
+      "INSERT OR IGNORE INTO rnfile"
+      "  SELECT mid FROM mlink WHERE pfnid>0 AND pfnid!=fnid;"
+    );
+    disableY = 1;
+  }
+  if( forkOnly ){
+    db_multi_exec(
+      "CREATE TEMP TABLE rnfork(rid INTEGER PRIMARY KEY);\n"
+      "INSERT OR IGNORE INTO rnfork(rid)\n"
+      "  SELECT pid FROM plink\n"
+      "   WHERE (SELECT value FROM tagxref WHERE tagid=%d AND rid=cid)=="
+      "           (SELECT value FROM tagxref WHERE tagid=%d AND rid=pid)\n"
+      "   GROUP BY pid"
+      "   HAVING count(*)>1;\n"
+      "INSERT OR IGNORE INTO rnfork(rid)"
+      "  SELECT cid FROM plink\n"
+      "   WHERE (SELECT value FROM tagxref WHERE tagid=%d AND rid=cid)=="
+      "           (SELECT value FROM tagxref WHERE tagid=%d AND rid=pid)\n"
+      "     AND pid IN rnfork;",
+      TAG_BRANCH, TAG_BRANCH, TAG_BRANCH, TAG_BRANCH
+    );
+    tmFlags |= TIMELINE_UNHIDE;
+    zType = "ci";
+    disableY = 1;
+  }
+  if( bisectOnly
+   && fossil_strcmp(g.zIpAddr,"127.0.0.1")==0
+   && db_open_local(0)
+  ){
+    int iCurrent = db_lget_int("checkout",0);
+    bisect_create_bilog_table(iCurrent);
+    tmFlags |= TIMELINE_UNHIDE | TIMELINE_BISECT;
+    zType = "ci";
+    disableY = 1;
+  }else{
+    bisectOnly = 0;
   }
 
   style_header("Timeline");
@@ -701,11 +1407,53 @@ void page_timeline(void){
   blob_zero(&desc);
   blob_append(&sql, "INSERT OR IGNORE INTO timeline ", -1);
   blob_append(&sql, timeline_query_for_www(), -1);
-  if( (p_rid || d_rid) && g.okRead ){
+  if( PB("fc") || PB("v") || PB("detail") ){
+    tmFlags |= TIMELINE_FCHANGES;
+  }
+  if( (tmFlags & TIMELINE_UNHIDE)==0 ){
+    blob_append_sql(&sql,
+      " AND NOT EXISTS(SELECT 1 FROM tagxref"
+      " WHERE tagid=%d AND tagtype>0 AND rid=blob.rid)\n",
+      TAG_HIDDEN
+    );
+  }
+  if( ((from_rid && to_rid) || (me_rid && you_rid)) && g.perm.Read ){
+    /* If from= and to= are present, display all nodes on a path connecting
+    ** the two */
+    PathNode *p = 0;
+    const char *zFrom = 0;
+    const char *zTo = 0;
+
+    if( from_rid && to_rid ){
+      p = path_shortest(from_rid, to_rid, noMerge, 0);
+      zFrom = P("from");
+      zTo = P("to");
+    }else{
+      if( path_common_ancestor(me_rid, you_rid) ){
+        p = path_first();
+      }
+      zFrom = P("me");
+      zTo = P("you");
+    }
+    blob_append(&sql, " AND event.objid IN (0", -1);
+    while( p ){
+      blob_append_sql(&sql, ",%d", p->rid);
+      p = p->u.pTo;
+    }
+    blob_append(&sql, ")", -1);
+    path_reset();
+    blob_append(&desc, "All nodes on the path from ", -1);
+    blob_appendf(&desc, "%z[%h]</a>", href("%R/info/%h", zFrom), zFrom);
+    blob_append(&desc, " to ", -1);
+    blob_appendf(&desc, "%z[%h]</a>", href("%R/info/%h",zTo), zTo);
+    tmFlags |= TIMELINE_DISJOINT;
+    db_multi_exec("%s", blob_sql_text(&sql));
+  }else if( (p_rid || d_rid) && g.perm.Read ){
     /* If p= or d= is present, ignore all other parameters other than n= */
     char *zUuid;
     int np, nd;
 
+    tmFlags |= TIMELINE_DISJOINT;
     if( p_rid && d_rid ){
       if( p_rid!=d_rid ) p_rid = d_rid;
       if( P("n")==0 ) nEntry = 10;
@@ -715,179 +1463,262 @@ void page_timeline(void){
     );
     zUuid = db_text("", "SELECT uuid FROM blob WHERE rid=%d",
                          p_rid ? p_rid : d_rid);
-    blob_appendf(&sql, " AND event.objid IN ok");
+    blob_append_sql(&sql, " AND event.objid IN ok");
     nd = 0;
     if( d_rid ){
       compute_descendants(d_rid, nEntry+1);
       nd = db_int(0, "SELECT count(*)-1 FROM ok");
-      if( nd>=0 ){
-        db_multi_exec("%s", blob_str(&sql));
-        blob_appendf(&desc, "%d descendant%s", nd,(1==nd)?"":"s");
-      }
-      timeline_add_dividers(
-        db_text("1","SELECT datetime(mtime,'localtime') FROM event"
-                    " WHERE objid=%d", d_rid)
-      );
+      if( nd>=0 ) db_multi_exec("%s", blob_sql_text(&sql));
+      if( nd>0 ) blob_appendf(&desc, "%d descendant%s", nd,(1==nd)?"":"s");
+      if( useDividers ) selectedRid = d_rid;
       db_multi_exec("DELETE FROM ok");
     }
     if( p_rid ){
-      compute_ancestors(p_rid, nEntry+1);
+      compute_ancestors(p_rid, nEntry+1, 0);
       np = db_int(0, "SELECT count(*)-1 FROM ok");
       if( np>0 ){
         if( nd>0 ) blob_appendf(&desc, " and ");
         blob_appendf(&desc, "%d ancestors", np);
-        db_multi_exec("%s", blob_str(&sql));
+        db_multi_exec("%s", blob_sql_text(&sql));
       }
-      if( d_rid==0 ){
-        timeline_add_dividers(  
-          db_text("1","SELECT datetime(mtime,'localtime') FROM event"
-                      " WHERE objid=%d", p_rid)
-        );
+      if( useDividers ) selectedRid = p_rid;
+    }
+    blob_appendf(&desc, " of %z[%S]</a>",
+                   href("%R/info/%!S", zUuid), zUuid);
+    if( d_rid ){
+      if( p_rid ){
+        /* If both p= and d= are set, we don't have the uuid of d yet. */
+        zUuid = db_text("", "SELECT uuid FROM blob WHERE rid=%d", d_rid);
       }
     }
-    if( g.okHistory ){
-      blob_appendf(&desc, " of <a href='%s/info/%s'>[%.10s]</a>",
-                   g.zBaseURL, zUuid, zUuid);
-    }else{
-      blob_appendf(&desc, " of check-in [%.10s]", zUuid);
+    style_submenu_entry("n","Max:",4,0);
+    timeline_y_submenu(1);
+    style_submenu_binary("v","With Files","Without Files",
+                         zType[0]!='a' && zType[0]!='c');
+  }else if( f_rid && g.perm.Read ){
+    /* If f= is present, ignore all other parameters other than n= */
+    char *zUuid;
+    db_multi_exec(
+       "CREATE TEMP TABLE IF NOT EXISTS ok(rid INTEGER PRIMARY KEY);"
+       "INSERT INTO ok VALUES(%d);"
+       "INSERT OR IGNORE INTO ok SELECT pid FROM plink WHERE cid=%d;"
+       "INSERT OR IGNORE INTO ok SELECT cid FROM plink WHERE pid=%d;",
+       f_rid, f_rid, f_rid
+    );
+    blob_append_sql(&sql, " AND event.objid IN ok");
+    db_multi_exec("%s", blob_sql_text(&sql));
+    if( useDividers ) selectedRid = f_rid;
+    blob_appendf(&desc, "Parents and children of check-in ");
+    zUuid = db_text("", "SELECT uuid FROM blob WHERE rid=%d", f_rid);
+    blob_appendf(&desc, "%z[%S]</a>", href("%R/info/%!S", zUuid), zUuid);
+    tmFlags |= TIMELINE_DISJOINT;
+    style_submenu_binary("v","With Files","Without Files",
+                         zType[0]!='a' && zType[0]!='c');
+    if( (tmFlags & TIMELINE_UNHIDE)==0 ){
+      timeline_submenu(&url, "Unhide", "unhide", "", 0);
     }
   }else{
-    int n;
+    /* Otherwise, a timeline based on a span of time */
+    int n, nBefore, nAfter;
     const char *zEType = "timeline item";
     char *zDate;
-    char *zNEntry = mprintf("%d", nEntry);
-    url_initialize(&url, "timeline");
-    url_add_parameter(&url, "n", zNEntry);
-    if( tagid>0 ){
-      if( zType[0]!='e' ) zType = "ci";
-      blob_appendf(&sql,
-        "AND (EXISTS(SELECT 1 FROM tagxref"
-                    " WHERE tagid=%d AND tagtype>0 AND rid=blob.rid)", tagid);
-
-      if( zBrName && zType[0]=='c' ){
-        /* The next two blob_appendf() calls add SQL that causes checkins that
-        ** are not part of the branch which are parents or childen of the branch
-        ** to be included in the report.  This related check-ins are useful
-        ** in helping to visualize what has happened on a quiescent branch 
-        ** that is infrequently merged with a much more activate branch.
-        */
-        url_add_parameter(&url, "r", zBrName);
-        blob_appendf(&sql,
-          " OR EXISTS(SELECT 1 FROM plink JOIN tagxref ON rid=cid"
-                     " WHERE tagid=%d AND tagtype>0 AND pid=blob.rid)", tagid);
-        blob_appendf(&sql,
-          " OR EXISTS(SELECT 1 FROM plink JOIN tagxref ON rid=pid"
-                     " WHERE tagid=%d AND tagtype>0 AND cid=blob.rid)", tagid);
-      }else{
-        url_add_parameter(&url, "t", zTagName);
-      }
-      blob_appendf(&sql, ")");
+    if( zUses ){
+      blob_append_sql(&sql, " AND event.objid IN usesfile ");
     }
-    if( (zType[0]=='w' && !g.okRdWiki)
-     || (zType[0]=='t' && !g.okRdTkt)
-     || (zType[0]=='e' && !g.okRdWiki)
-     || (zType[0]=='c' && !g.okRead)
+    if( renameOnly ){
+      blob_append_sql(&sql, " AND event.objid IN rnfile ");
+    }
+    if( forkOnly ){
+      blob_append_sql(&sql, " AND event.objid IN rnfork ");
+    }
+    if( bisectOnly ){
+      blob_append_sql(&sql, " AND event.objid IN (SELECT rid FROM bilog) ");
+    }
+    if( zYearMonth ){
+      blob_append_sql(&sql, " AND %Q=strftime('%%Y-%%m',event.mtime) ",
+                   zYearMonth);
+    }
+    else if( zYearWeek ){
+      blob_append_sql(&sql, " AND %Q=strftime('%%Y-%%W',event.mtime) ",
+                   zYearWeek);
+    }
+    else if( zDay ){
+      blob_append_sql(&sql, " AND %Q=strftime('%%Y-%%m-%%d',event.mtime) ",
+                   zDay);
+    }
+    if( tagid ){
+      blob_append_sql(&sql,
+        " AND (EXISTS(SELECT 1 FROM tagxref"
+            " WHERE tagid=%d AND tagtype>0 AND rid=blob.rid)\n", tagid);
+
+      if( zBrName ){
+        /* The next two blob_appendf() calls add SQL that causes check-ins that
+        ** are not part of the branch which are parents or children of the
+        ** branch to be included in the report.  This related check-ins are
+        ** useful in helping to visualize what has happened on a quiescent
+        ** branch that is infrequently merged with a much more activate branch.
+        */
+        blob_append_sql(&sql,
+          " OR EXISTS(SELECT 1 FROM plink CROSS JOIN tagxref ON rid=cid"
+                     " WHERE tagid=%d AND tagtype>0 AND pid=blob.rid)\n",
+           tagid
+        );
+        if( (tmFlags & TIMELINE_UNHIDE)==0 ){
+          blob_append_sql(&sql,
+            " AND NOT EXISTS(SELECT 1 FROM plink JOIN tagxref ON rid=cid"
+                       " WHERE tagid=%d AND tagtype>0 AND pid=blob.rid)\n",
+            TAG_HIDDEN
+          );
+        }
+        if( P("mionly")==0 ){
+          blob_append_sql(&sql,
+            " OR EXISTS(SELECT 1 FROM plink CROSS JOIN tagxref ON rid=pid"
+                       " WHERE tagid=%d AND tagtype>0 AND cid=blob.rid)\n",
+            tagid
+          );
+          if( (tmFlags & TIMELINE_UNHIDE)==0 ){
+            blob_append_sql(&sql,
+              " AND NOT EXISTS(SELECT 1 FROM plink JOIN tagxref ON rid=pid"
+              " WHERE tagid=%d AND tagtype>0 AND cid=blob.rid)\n",
+              TAG_HIDDEN
+            );
+          }
+        }
+      }
+      blob_append_sql(&sql, ")");
+    }
+    if( (zType[0]=='w' && !g.perm.RdWiki)
+     || (zType[0]=='t' && !g.perm.RdTkt)
+     || (zType[0]=='e' && !g.perm.RdWiki)
+     || (zType[0]=='c' && !g.perm.Read)
+     || (zType[0]=='g' && !g.perm.Read)
     ){
       zType = "all";
     }
     if( zType[0]=='a' ){
-      if( !g.okRead || !g.okRdWiki || !g.okRdTkt ){
+      if( !g.perm.Read || !g.perm.RdWiki || !g.perm.RdTkt ){
         char cSep = '(';
-        blob_appendf(&sql, " AND event.type IN ");
-        if( g.okRead ){
-          blob_appendf(&sql, "%c'ci'", cSep);
+        blob_append_sql(&sql, " AND event.type IN ");
+        if( g.perm.Read ){
+          blob_append_sql(&sql, "%c'ci','g'", cSep);
           cSep = ',';
         }
-        if( g.okRdWiki ){
-          blob_appendf(&sql, "%c'w','e'", cSep);
+        if( g.perm.RdWiki ){
+          blob_append_sql(&sql, "%c'w','e'", cSep);
           cSep = ',';
         }
-        if( g.okRdTkt ){
-          blob_appendf(&sql, "%c't'", cSep);
+        if( g.perm.RdTkt ){
+          blob_append_sql(&sql, "%c't'", cSep);
           cSep = ',';
         }
-        blob_appendf(&sql, ")");
+        blob_append_sql(&sql, ")");
       }
     }else{ /* zType!="all" */
-      blob_appendf(&sql, " AND event.type=%Q", zType);
-      url_add_parameter(&url, "y", zType);
+      blob_append_sql(&sql, " AND event.type=%Q", zType);
       if( zType[0]=='c' ){
-        zEType = "checkin";
+        zEType = "check-in";
       }else if( zType[0]=='w' ){
         zEType = "wiki edit";
       }else if( zType[0]=='t' ){
         zEType = "ticket change";
       }else if( zType[0]=='e' ){
-        zEType = "event";
+        zEType = "technical note";
+      }else if( zType[0]=='g' ){
+        zEType = "tag";
       }
     }
     if( zUser ){
-      blob_appendf(&sql, " AND event.user=%Q", zUser);
-      url_add_parameter(&url, "u", zUser);
+      int n = db_int(0,"SELECT count(*) FROM event"
+                       " WHERE user=%Q OR euser=%Q", zUser, zUser);
+      if( n<=nEntry ){
+        zCirca = zBefore = zAfter = 0;
+        nEntry = -1;
+      }
+      blob_append_sql(&sql, " AND (event.user=%Q OR event.euser=%Q)",
+                   zUser, zUser);
+      zThisUser = zUser;
     }
-    if ( zSearch ){
-      blob_appendf(&sql,
+    if( zSearch ){
+      blob_append_sql(&sql,
         " AND (event.comment LIKE '%%%q%%' OR event.brief LIKE '%%%q%%')",
         zSearch, zSearch);
-      url_add_parameter(&url, "s", zSearch);
     }
-    if( zAfter ){
-      while( isspace(zAfter[0]) ){ zAfter++; }
-      if( zAfter[0] ){
-        blob_appendf(&sql, 
-           " AND event.mtime>=(SELECT julianday(%Q, 'utc'))"
-           " ORDER BY event.mtime ASC", zAfter);
-        url_add_parameter(&url, "a", zAfter);
-        zBefore = 0;
+    rBefore = symbolic_name_to_mtime(zBefore);
+    rAfter = symbolic_name_to_mtime(zAfter);
+    rCirca = symbolic_name_to_mtime(zCirca);
+    if( rAfter>0.0 ){
+      if( rBefore>0.0 ){
+        blob_append_sql(&sql,
+           " AND event.mtime>=%.17g AND event.mtime<=%.17g"
+           " ORDER BY event.mtime ASC", rAfter-ONE_SECOND, rBefore+ONE_SECOND);
+        nEntry = -1;
       }else{
-        zAfter = 0;
+        blob_append_sql(&sql,
+           " AND event.mtime>=%.17g  ORDER BY event.mtime ASC",
+           rAfter-ONE_SECOND);
       }
-    }else if( zBefore ){
-      while( isspace(zBefore[0]) ){ zBefore++; }
-      if( zBefore[0] ){
-        blob_appendf(&sql, 
-           " AND event.mtime<=(SELECT julianday(%Q, 'utc'))"
-           " ORDER BY event.mtime DESC", zBefore);
-        url_add_parameter(&url, "b", zBefore);
-       }else{
-        zBefore = 0;
-      }
-    }else if( zCirca ){
-      while( isspace(zCirca[0]) ){ zCirca++; }
-      if( zCirca[0] ){
-        double rCirca = db_double(0.0, "SELECT julianday(%Q, 'utc')", zCirca);
-        Blob sql2;
-        blob_init(&sql2, blob_str(&sql), -1);
-        blob_appendf(&sql2,
-            " AND event.mtime<=%f ORDER BY event.mtime DESC LIMIT %d",
-            rCirca, (nEntry+1)/2
-        );
-        db_multi_exec("%s", blob_str(&sql2));
-        blob_reset(&sql2);
-        blob_appendf(&sql,
-            " AND event.mtime>=%f ORDER BY event.mtime ASC",
-            rCirca
-        );
+      zCirca = 0;
+      url_add_parameter(&url, "c", 0);
+    }else if( rBefore>0.0 ){
+      blob_append_sql(&sql,
+         " AND event.mtime<=%.17g ORDER BY event.mtime DESC",
+         rBefore+ONE_SECOND);
+      zCirca = 0;
+      url_add_parameter(&url, "c", 0);
+    }else if( rCirca>0.0 ){
+      Blob sql2;
+      blob_init(&sql2, blob_sql_text(&sql), -1);
+      blob_append_sql(&sql2,
+          " AND event.mtime<=%f ORDER BY event.mtime DESC", rCirca);
+      if( nEntry>0 ){
+        blob_append_sql(&sql2," LIMIT %d", (nEntry+1)/2);
         nEntry -= (nEntry+1)/2;
-        timeline_add_dividers(zCirca);
-        url_add_parameter(&url, "c", zCirca);
-      }else{
-        zCirca = 0;
       }
+      if( PB("showsql") ){
+         @ <pre>%h(blob_sql_text(&sql2))</pre>
+      }
+      db_multi_exec("%s", blob_sql_text(&sql2));
+      blob_reset(&sql2);
+      blob_append_sql(&sql,
+          " AND event.mtime>=%f ORDER BY event.mtime ASC",
+          rCirca
+      );
+      if( zMark==0 ) zMark = zCirca;
     }else{
-      blob_appendf(&sql, " ORDER BY event.mtime DESC");
+      blob_append_sql(&sql, " ORDER BY event.mtime DESC");
     }
-    blob_appendf(&sql, " LIMIT %d", nEntry);
-    db_multi_exec("%s", blob_str(&sql));
+    if( nEntry>0 ) blob_append_sql(&sql, " LIMIT %d", nEntry);
+    db_multi_exec("%s", blob_sql_text(&sql));
 
-    n = db_int(0, "SELECT count(*) FROM timeline /*scan*/");
-    if( n<nEntry && zAfter ){
-      cgi_redirect(url_render(&url, "a", 0, "b", 0));
-    }
-    if( zAfter==0 && zBefore==0 && zCirca==0 ){
+    n = db_int(0, "SELECT count(*) FROM timeline WHERE etype!='div' /*scan*/");
+    if( zYearMonth ){
+      blob_appendf(&desc, "%s events for %h", zEType, zYearMonth);
+    }else if( zYearWeek ){
+      blob_appendf(&desc, "%s events for year/week %h", zEType, zYearWeek);
+    }else if( zDay ){
+      blob_appendf(&desc, "%s events occurring on %h", zEType, zDay);
+    }else if( zBefore==0 && zCirca==0 && n>=nEntry && nEntry>0 ){
       blob_appendf(&desc, "%d most recent %ss", n, zEType);
     }else{
       blob_appendf(&desc, "%d %ss", n, zEType);
+    }
+    if( zUses ){
+      char *zFilenames = names_of_file(zUses);
+      blob_appendf(&desc, " using file %s version %z%S</a>", zFilenames,
+                   href("%R/artifact/%!S",zUses), zUses);
+      tmFlags |= TIMELINE_DISJOINT;
+    }
+    if( renameOnly ){
+      blob_appendf(&desc, " that contain filename changes");
+      tmFlags |= TIMELINE_DISJOINT|TIMELINE_FRENAMES;
+    }
+    if( forkOnly ){
+      blob_appendf(&desc, " associated with forks");
+      tmFlags |= TIMELINE_DISJOINT;
+    }
+    if( bisectOnly ){
+      blob_appendf(&desc, " in the most recent bisect");
+      tmFlags |= TIMELINE_DISJOINT;
     }
     if( zUser ){
       blob_appendf(&desc, " by user %h", zUser);
@@ -900,57 +1731,82 @@ void page_timeline(void){
       blob_appendf(&desc, " related to \"%h\"", zBrName);
       tmFlags |= TIMELINE_DISJOINT;
     }
-    if( zAfter ){
-      blob_appendf(&desc, " occurring on or after %h.<br />", zAfter);
-    }else if( zBefore ){
+    if( rAfter>0.0 ){
+      if( rBefore>0.0 ){
+        blob_appendf(&desc, " occurring between %h and %h.<br>",
+                     zAfter, zBefore);
+      }else{
+        blob_appendf(&desc, " occurring on or after %h.<br />", zAfter);
+      }
+    }else if( rBefore>0.0 ){
       blob_appendf(&desc, " occurring on or before %h.<br />", zBefore);
-    }else if( zCirca ){
+    }else if( rCirca>0.0 ){
       blob_appendf(&desc, " occurring around %h.<br />", zCirca);
     }
     if( zSearch ){
       blob_appendf(&desc, " matching \"%h\"", zSearch);
     }
-    if( g.okHistory ){
-      if( zAfter || n==nEntry ){
+    if( g.perm.Hyperlink ){
+      if( zCirca && rCirca ){
+        nBefore = db_int(0,
+          "SELECT count(*) FROM timeline WHERE etype!='div'"
+          "   AND sortby<=%f /*scan*/", rCirca);
+        nAfter = db_int(0,
+          "SELECT count(*) FROM timeline WHERE etype!='div'"
+          "   AND sortby>=%f /*scan*/", rCirca);
         zDate = db_text(0, "SELECT min(timestamp) FROM timeline /*scan*/");
-        timeline_submenu(&url, "Older", "b", zDate, "a");
+        if( nBefore>=nEntry ){
+          timeline_submenu(&url, "Older", "b", zDate, "c");
+          zOlderButton = fossil_strdup(url_render(&url, "b", zDate, "c", 0));
+        }
+        if( nAfter>=nEntry ){
+          timeline_submenu(&url, "Newer", "a", zDate, "c");
+        }
         free(zDate);
-      }
-      if( zBefore || (zAfter && n==nEntry) ){
-        zDate = db_text(0, "SELECT max(timestamp) FROM timeline /*scan*/");
-        timeline_submenu(&url, "Newer", "a", zDate, "b");
-        free(zDate);
-      }else if( tagid==0 ){
-        if( zType[0]!='a' ){
-          timeline_submenu(&url, "All Types", "y", "all", 0);
+      }else{
+        if( zAfter || n==nEntry ){
+          zDate = db_text(0, "SELECT min(timestamp) FROM timeline /*scan*/");
+          timeline_submenu(&url, "Older", "b", zDate, "a");
+          zOlderButton = fossil_strdup(url_render(&url, "b", zDate, "a", 0));
+          free(zDate);
         }
-        if( zType[0]!='w' && g.okRdWiki ){
-          timeline_submenu(&url, "Wiki Only", "y", "w", 0);
-        }
-        if( zType[0]!='c' && g.okRead ){
-          timeline_submenu(&url, "Checkins Only", "y", "ci", 0);
-        }
-        if( zType[0]!='t' && g.okRdTkt ){
-          timeline_submenu(&url, "Tickets Only", "y", "t", 0);
-        }
-        if( zType[0]!='e' && g.okRdWiki ){
-          timeline_submenu(&url, "Events Only", "y", "e", 0);
+        if( zBefore || (zAfter && n==nEntry) ){
+          zDate = db_text(0, "SELECT max(timestamp) FROM timeline /*scan*/");
+          timeline_submenu(&url, "Newer", "a", zDate, "b");
+          free(zDate);
         }
       }
-      if( nEntry>20 ){
-        timeline_submenu(&url, "20 Entries", "n", "20", 0);
+      if( zType[0]=='a' || zType[0]=='c' ){
+        if( (tmFlags & TIMELINE_UNHIDE)==0 ){
+          timeline_submenu(&url, "Unhide", "unhide", "", 0);
+        }
       }
-      if( nEntry<200 ){
-        timeline_submenu(&url, "200 Entries", "n", "200", 0);
-      }
+      style_submenu_entry("n","Max:",4,0);
+      timeline_y_submenu(disableY);
+      style_submenu_binary("v","With Files","Without Files",
+                           zType[0]!='a' && zType[0]!='c');
     }
   }
+  if( PB("showsql") ){
+    @ <pre>%h(blob_sql_text(&sql))</pre>
+  }
+  if( search_restrict(SRCH_CKIN)!=0 ){
+    style_submenu_element("Search", 0, "%R/search?y=c");
+  }
+  if( PB("showid") ) tmFlags |= TIMELINE_SHOWRID;
+  if( useDividers && zMark && zMark[0] ){
+    double r = symbolic_name_to_mtime(zMark);
+    if( r>0.0 ) selectedRid = timeline_add_divider(r);
+  }
   blob_zero(&sql);
-  db_prepare(&q, "SELECT * FROM timeline ORDER BY timestamp DESC /*scan*/");
+  db_prepare(&q, "SELECT * FROM timeline ORDER BY sortby DESC /*scan*/");
   @ <h2>%b(&desc)</h2>
   blob_reset(&desc);
-  www_print_timeline(&q, tmFlags, 0);
+  www_print_timeline(&q, tmFlags, zThisUser, zThisTag, selectedRid, 0);
   db_finalize(&q);
+  if( zOlderButton ){
+    @ %z(xhref("class='button'","%z",zOlderButton))Older</a>
+  }
   style_footer();
 }
 
@@ -958,8 +1814,14 @@ void page_timeline(void){
 ** The input query q selects various records.  Print a human-readable
 ** summary of those records.
 **
-** Limit the number of entries printed to nLine.
-** 
+** Limit number of lines or entries printed to nLimit.  If nLimit is zero
+** there is no limit.  If nLimit is greater than zero, limit the number of
+** complete entries printed.  If nLimit is less than zero, attempt to limit
+** the number of lines printed (this is basically the legacy behavior).
+** The line limit, if used, is approximate because it is only checked on a
+** per-entry basis.  If verbose mode, the file name details are considered
+** to be part of the entry.
+**
 ** The query should return these columns:
 **
 **    0.  rid
@@ -968,19 +1830,26 @@ void page_timeline(void){
 **    3.  Comment string and user
 **    4.  Number of non-merge children
 **    5.  Number of parents
+**    6.  mtime
+**    7.  branch
 */
-void print_timeline(Stmt *q, int mxLine){
+void print_timeline(Stmt *q, int nLimit, int width, int verboseFlag){
+  int nAbsLimit = (nLimit >= 0) ? nLimit : -nLimit;
   int nLine = 0;
+  int nEntry = 0;
   char zPrevDate[20];
-  const char *zCurrentUuid=0;
-  zPrevDate[0] = 0;
+  const char *zCurrentUuid = 0;
+  int fchngQueryInit = 0;     /* True if fchngQuery is initialized */
+  Stmt fchngQuery;            /* Query for file changes on check-ins */
+  int rc;
 
+  zPrevDate[0] = 0;
   if( g.localOpen ){
     int rid = db_lget_int("checkout", 0);
     zCurrentUuid = db_text(0, "SELECT uuid FROM blob WHERE rid=%d", rid);
   }
 
-  while( db_step(q)==SQLITE_ROW && nLine<=mxLine ){
+  while( (rc=db_step(q))==SQLITE_ROW ){
     int rid = db_column_int(q, 0);
     const char *zId = db_column_text(q, 1);
     const char *zDate = db_column_text(q, 2);
@@ -990,16 +1859,23 @@ void print_timeline(Stmt *q, int mxLine){
     char *zFree = 0;
     int n = 0;
     char zPrefix[80];
-    char zUuid[UUID_SIZE+1];
-    
-    sprintf(zUuid, "%.10s", zId);
-    if( memcmp(zDate, zPrevDate, 10) ){
-      printf("=== %.10s ===\n", zDate);
+
+    if( nAbsLimit!=0 ){
+      if( nLimit<0 && nLine>=nAbsLimit ){
+        fossil_print("--- line limit (%d) reached ---\n", nAbsLimit);
+        break; /* line count limit hit, stop. */
+      }else if( nEntry>=nAbsLimit ){
+        fossil_print("--- entry limit (%d) reached ---\n", nAbsLimit);
+        break; /* entry count limit hit, stop. */
+      }
+    }
+    if( fossil_strnicmp(zDate, zPrevDate, 10) ){
+      fossil_print("=== %.10s ===\n", zDate);
       memcpy(zPrevDate, zDate, 10);
-      nLine++;
+      nLine++; /* record another line */
     }
     if( zCom==0 ) zCom = "";
-    printf("%.8s ", &zDate[11]);
+    fossil_print("%.8s ", &zDate[11]);
     zPrefix[0] = 0;
     if( nParent>1 ){
       sqlite3_snprintf(sizeof(zPrefix), zPrefix, "*MERGE* ");
@@ -1015,14 +1891,60 @@ void print_timeline(Stmt *q, int mxLine){
       sqlite3_snprintf(sizeof(zPrefix)-n, &zPrefix[n], zBrType);
       n = strlen(zPrefix);
     }
-    if( zCurrentUuid && strcmp(zCurrentUuid,zId)==0 ){
+    if( fossil_strcmp(zCurrentUuid,zId)==0 ){
       sqlite3_snprintf(sizeof(zPrefix)-n, &zPrefix[n], "*CURRENT* ");
-      n += strlen(zPrefix);
+      n += strlen(zPrefix+n);
     }
-    zFree = sqlite3_mprintf("[%.10s] %s%s", zUuid, zPrefix, zCom);
-    nLine += comment_print(zFree, 9, 79);
-    sqlite3_free(zFree);
+    if( content_is_private(rid) ){
+      sqlite3_snprintf(sizeof(zPrefix)-n, &zPrefix[n], "*UNPUBLISHED* ");
+      n += strlen(zPrefix+n);
+    }
+    zFree = mprintf("[%S] %s%s", zId, zPrefix, zCom);
+    /* record another X lines */
+    nLine += comment_print(zFree, zCom, 9, width, g.comFmtFlags);
+    fossil_free(zFree);
+
+    if(verboseFlag){
+      if( !fchngQueryInit ){
+        db_prepare(&fchngQuery,
+           "SELECT (pid<=0) AS isnew,"
+           "       (fid==0) AS isdel,"
+           "       (SELECT name FROM filename WHERE fnid=mlink.fnid) AS name,"
+           "       (SELECT uuid FROM blob WHERE rid=fid),"
+           "       (SELECT uuid FROM blob WHERE rid=pid)"
+           "  FROM mlink"
+           " WHERE mid=:mid AND pid!=fid AND NOT mlink.isaux"
+           " ORDER BY 3 /*sort*/"
+        );
+        fchngQueryInit = 1;
+      }
+      db_bind_int(&fchngQuery, ":mid", rid);
+      while( db_step(&fchngQuery)==SQLITE_ROW ){
+        const char *zFilename = db_column_text(&fchngQuery, 2);
+        int isNew = db_column_int(&fchngQuery, 0);
+        int isDel = db_column_int(&fchngQuery, 1);
+        if( isNew ){
+          fossil_print("   ADDED %s\n",zFilename);
+        }else if( isDel ){
+          fossil_print("   DELETED %s\n",zFilename);
+        }else{
+          fossil_print("   EDITED %s\n", zFilename);
+        }
+        nLine++; /* record another line */
+      }
+      db_reset(&fchngQuery);
+    }
+    nEntry++; /* record another complete entry */
   }
+  if( rc==SQLITE_DONE ){
+    /* Did the underlying query actually have all entries? */
+    if( nAbsLimit==0 ){
+      fossil_print("+++ end of timeline (%d) +++\n", nEntry);
+    }else{
+      fossil_print("+++ no more data (%d) +++\n", nEntry);
+    }
+  }
+  if( fchngQueryInit ) db_finalize(&fchngQuery);
 }
 
 /*
@@ -1030,11 +1952,11 @@ void print_timeline(Stmt *q, int mxLine){
 ** a timeline query for display on a TTY.
 */
 const char *timeline_query_for_tty(void){
-  static const char zBaseSql[] = 
+  static const char zBaseSql[] =
     @ SELECT
-    @   blob.rid,
+    @   blob.rid AS rid,
     @   uuid,
-    @   datetime(event.mtime,'localtime'),
+    @   datetime(event.mtime,toLocal()) AS mDateTime,
     @   coalesce(ecomment,comment)
     @     || ' (user: ' || coalesce(euser,user,'?')
     @     || (SELECT case when length(x)>0 then ' tags: ' || x else '' end
@@ -1042,11 +1964,18 @@ const char *timeline_query_for_tty(void){
     @                   FROM tag, tagxref
     @                  WHERE tagname GLOB 'sym-*' AND tag.tagid=tagxref.tagid
     @                    AND tagxref.rid=blob.rid AND tagxref.tagtype>0))
-    @     || ')',
-    @   (SELECT count(*) FROM plink WHERE pid=blob.rid AND isprim),
-    @   (SELECT count(*) FROM plink WHERE cid=blob.rid)
-    @ FROM event, blob
+    @     || ')' as comment,
+    @   (SELECT count(*) FROM plink WHERE pid=blob.rid AND isprim)
+    @        AS primPlinkCount,
+    @   (SELECT count(*) FROM plink WHERE cid=blob.rid) AS plinkCount,
+    @   event.mtime AS mtime,
+    @   tagxref.value AS branch
+    @ FROM tag CROSS JOIN event CROSS JOIN blob
+    @      LEFT JOIN tagxref ON tagxref.tagid=tag.tagid
+    @   AND tagxref.tagtype>0
+    @   AND tagxref.rid=blob.rid
     @ WHERE blob.rid=event.objid
+    @   AND tag.tagname='branch'
   ;
   return zBaseSql;
 }
@@ -1059,42 +1988,56 @@ static int isIsoDate(const char *z){
   return strlen(z)==10
       && z[4]=='-'
       && z[7]=='-'
-      && isdigit(z[0])
-      && isdigit(z[5]);
+      && fossil_isdigit(z[0])
+      && fossil_isdigit(z[5]);
 }
 
 /*
 ** COMMAND: timeline
 **
-** Usage: %fossil timeline ?WHEN? ?BASELINE|DATETIME? ?-n N? ?-t TYPE?
+** Usage: %fossil timeline ?WHEN? ?CHECKIN|DATETIME? ?OPTIONS?
 **
 ** Print a summary of activity going backwards in date and time
 ** specified or from the current date and time if no arguments
-** are given.  Show as many as N (default 20) check-ins.  The
-** WHEN argument can be any unique abbreviation of one of these
-** keywords:
+** are given.  The WHEN argument can be any unique abbreviation
+** of one of these keywords:
 **
 **     before
 **     after
 **     descendants | children
 **     ancestors | parents
 **
-** The BASELINE can be any unique prefix of 4 characters or more.
+** The CHECKIN can be any unique prefix of 4 characters or more.
 ** The DATETIME should be in the ISO8601 format.  For
 ** examples: "2007-08-18 07:21:21".  You can also say "current"
 ** for the current version or "now" for the current time.
 **
-** The optional TYPE argument may any types supported by the /timeline
-** page. For example:
-**
-**     w  = wiki commits only
-**     ci = file commits only
-**     t  = tickets only
+** Options:
+**   -n|--limit N         Output the first N entries (default 20 lines).
+**                        N=0 means no limit.
+**   -p|--path PATH       Output items affecting PATH only.
+**                        PATH can be a file or a sub directory.
+**   --offset P           skip P changes
+**   -t|--type TYPE       Output items from the given types only, such as:
+**                            ci = file commits only
+**                            e  = technical notes only
+**                            t  = tickets only
+**                            w  = wiki commits only
+**   -v|--verbose         Output the list of files changed by each commit
+**                        and the type of each change (edited, deleted,
+**                        etc.) after the check-in comment.
+**   -W|--width <num>     Width of lines (default is to auto-detect). Must be
+**                        >20 or 0 (= no limit, resulting in a single line per
+**                        entry).
+**   -R REPO_FILE         Specifies the repository db to use. Default is
+**                        the current checkout's repository.
 */
 void timeline_cmd(void){
   Stmt q;
-  int n, k;
-  const char *zCount;
+  int n, k, width;
+  const char *zLimit;
+  const char *zWidth;
+  const char *zOffset;
   const char *zType;
   char *zOrigin;
   char *zDate;
@@ -1102,14 +2045,43 @@ void timeline_cmd(void){
   int objid = 0;
   Blob uuid;
   int mode = 0 ;       /* 0:none  1: before  2:after  3:children  4:parents */
-  db_find_and_open_repository(1);
-  zCount = find_option("count","n",1);
-  zType = find_option("type","t",1);
-  if( zCount ){
-    n = atoi(zCount);
-  }else{
-    n = 20;
+  int verboseFlag = 0 ;
+  int iOffset;
+  const char *zFilePattern = 0;
+  Blob treeName;
+
+  verboseFlag = find_option("verbose","v", 0)!=0;
+  if( !verboseFlag){
+    verboseFlag = find_option("showfiles","f", 0)!=0; /* deprecated */
   }
+  db_find_and_open_repository(0, 0);
+  zLimit = find_option("limit","n",1);
+  zWidth = find_option("width","W",1);
+  zType = find_option("type","t",1);
+  zFilePattern = find_option("path","p",1);
+
+  if( !zLimit ){
+    zLimit = find_option("count",0,1);
+  }
+  if( zLimit ){
+    n = atoi(zLimit);
+  }else{
+    n = -20;
+  }
+  if( zWidth ){
+    width = atoi(zWidth);
+    if( (width!=0) && (width<=20) ){
+      fossil_fatal("-W|--width value must be >20 or 0");
+    }
+  }else{
+    width = -1;
+  }
+  zOffset = find_option("offset",0,1);
+  iOffset = zOffset ? atoi(zOffset) : 0;
+
+  /* We should be done with options.. */
+  verify_all_options();
+
   if( g.argc>=4 ){
     k = strlen(g.argv[2]);
     if( strncmp(g.argv[2],"before",k)==0 ){
@@ -1124,13 +2096,14 @@ void timeline_cmd(void){
       mode = 4;
     }else if( strncmp(g.argv[2],"parents",k)==0 ){
       mode = 4;
-    }else if(!zType && !zCount){
-      usage("?WHEN? ?BASELINE|DATETIME? ?-n|--count N? ?-t TYPE?");
+    }else if(!zType && !zLimit){
+      usage("?WHEN? ?CHECKIN|DATETIME? ?-n|--limit #? ?-t|--type TYPE? "
+            "?-W|--width WIDTH? ?-p|--path PATH");
     }
     if( '-' != *g.argv[3] ){
-	zOrigin = g.argv[3];
+      zOrigin = g.argv[3];
     }else{
-	zOrigin = "now";
+      zOrigin = "now";
     }
   }else if( g.argc==3 ){
     zOrigin = g.argv[2];
@@ -1140,7 +2113,7 @@ void timeline_cmd(void){
   k = strlen(zOrigin);
   blob_zero(&uuid);
   blob_append(&uuid, zOrigin, -1);
-  if( strcmp(zOrigin, "now")==0 ){
+  if( fossil_strcmp(zOrigin, "now")==0 ){
     if( mode==3 || mode==4 ){
       fossil_fatal("cannot compute descendants or ancestors of a date");
     }
@@ -1151,7 +2124,7 @@ void timeline_cmd(void){
     }
     objid = db_lget_int("checkout",0);
     zDate = mprintf("(SELECT mtime FROM plink WHERE cid=%d)", objid);
-  }else if( name_to_uuid(&uuid, 0)==0 ){
+  }else if( name_to_uuid(&uuid, 0, "*")==0 ){
     objid = db_int(0, "SELECT rid FROM blob WHERE uuid=%B", &uuid);
     zDate = mprintf("(SELECT mtime FROM plink WHERE cid=%d)", objid);
   }else{
@@ -1162,14 +2135,29 @@ void timeline_cmd(void){
     if( mode==0 ){
       if( isIsoDate(zOrigin) ) zShift = ",'+1 day'";
     }
-    zDate = mprintf("(SELECT julianday(%Q%s, 'utc'))", zOrigin, zShift);
+    zDate = mprintf("(SELECT julianday(%Q%s, fromLocal())", zOrigin, zShift);
   }
+
+  if( zFilePattern ){
+    if( zType==0 ){
+      /* When zFilePattern is specified and type is not specified, only show
+       * file check-ins */
+      zType="ci";
+    }
+    file_tree_name(zFilePattern, &treeName, 0, 1);
+    if( fossil_strcmp(blob_str(&treeName), ".")==0 ){
+      /* When zTreeName refers to g.zLocalRoot, it's like not specifying
+       * zFilePattern. */
+      zFilePattern = 0;
+    }
+  }
+
   if( mode==0 ) mode = 1;
   blob_zero(&sql);
   blob_append(&sql, timeline_query_for_tty(), -1);
-  blob_appendf(&sql, "  AND event.mtime %s %s",
+  blob_append_sql(&sql, "\n  AND event.mtime %s %s",
      (mode==1 || mode==4) ? "<=" : ">=",
-     zDate
+     zDate /*safe-for-%s*/
   );
 
   if( mode==3 || mode==4 ){
@@ -1177,42 +2165,146 @@ void timeline_cmd(void){
     if( mode==3 ){
       compute_descendants(objid, n);
     }else{
-      compute_ancestors(objid, n);
+      compute_ancestors(objid, n, 0);
     }
-    blob_appendf(&sql, " AND blob.rid IN ok");
+    blob_append_sql(&sql, "\n  AND blob.rid IN ok");
   }
   if( zType && (zType[0]!='a') ){
-    blob_appendf(&sql, " AND event.type=%Q ", zType);
+    blob_append_sql(&sql, "\n  AND event.type=%Q ", zType);
   }
-
-  blob_appendf(&sql, " ORDER BY event.mtime DESC");
-  db_prepare(&q, blob_str(&sql));
+  if( zFilePattern ){
+    blob_append(&sql,
+       "\n  AND EXISTS(SELECT 1 FROM mlink\n"
+         "              WHERE mlink.mid=event.objid\n"
+         "                AND mlink.fnid IN ", -1);
+    if( filenames_are_case_sensitive() ){
+      blob_append_sql(&sql,
+        "(SELECT fnid FROM filename"
+        " WHERE name=%Q"
+        " OR name GLOB '%q/*')",
+        blob_str(&treeName), blob_str(&treeName));
+    }else{
+      blob_append_sql(&sql,
+        "(SELECT fnid FROM filename"
+        " WHERE name=%Q COLLATE nocase"
+        " OR lower(name) GLOB lower('%q/*'))",
+        blob_str(&treeName), blob_str(&treeName));
+    }
+    blob_append(&sql, ")", -1);
+  }
+  blob_append_sql(&sql, "\nORDER BY event.mtime DESC");
+  if( iOffset>0 ){
+    /* Don't handle LIMIT here, otherwise print_timeline()
+     * will not determine the end-marker correctly! */
+    blob_append_sql(&sql, "\n LIMIT -1 OFFSET %d", iOffset);
+  }
+  db_prepare(&q, "%s", blob_sql_text(&sql));
   blob_reset(&sql);
-  print_timeline(&q, n);
+  print_timeline(&q, n, width, verboseFlag);
+  db_finalize(&q);
+}
+
+
+/*
+** COMMAND: test-timewarp-list
+**
+** Usage: %fossil test-timewarp-list ?-v|---verbose?
+**
+** Display all instances of child check-ins that appear earlier in time
+** than their parent.  If the -v|--verbose option is provided, both the
+** parent and child check-ins and their times are shown.
+*/
+void test_timewarp_cmd(void){
+  Stmt q;
+  int verboseFlag;
+
+  db_find_and_open_repository(0, 0);
+  verboseFlag = find_option("verbose", "v", 0)!=0;
+  if( !verboseFlag ){
+    verboseFlag = find_option("detail", 0, 0)!=0; /* deprecated */
+  }
+  db_prepare(&q,
+     "SELECT (SELECT uuid FROM blob WHERE rid=p.cid),"
+     "       (SELECT uuid FROM blob WHERE rid=c.cid),"
+     "       datetime(p.mtime), datetime(c.mtime)"
+     "  FROM plink p, plink c"
+     " WHERE p.cid=c.pid  AND p.mtime>c.mtime"
+  );
+  while( db_step(&q)==SQLITE_ROW ){
+    if( !verboseFlag ){
+      fossil_print("%s\n", db_column_text(&q, 1));
+    }else{
+      fossil_print("%.14s -> %.14s   %s -> %s\n",
+         db_column_text(&q, 0),
+         db_column_text(&q, 1),
+         db_column_text(&q, 2),
+         db_column_text(&q, 3));
+    }
+  }
   db_finalize(&q);
 }
 
 /*
-** This is a version of the "localtime()" function from the standard
-** C library.  It converts a unix timestamp (seconds since 1970) into
-** a broken-out local time structure.
+** WEBPAGE: timewarps
 **
-** This modified version of localtime() works like the library localtime()
-** by default.  Except if the timeline-utc property is set, this routine
-** uses gmttime() instead.  Thus by setting the timeline-utc property, we
-** can get all localtimes to be displayed at UTC time.
+** Show all check-ins that are "timewarps".  A timewarp is a
+** check-in that occurs before its parent, according to the
+** timestamp information on the check-in.  This can only actually
+** happen, of course, if a users system clock is set incorrectly.
 */
-struct tm *fossil_localtime(const time_t *clock){
-  if( g.fTimeFormat==0 ){
-    if( db_get_int("timeline-utc", 1) ){
-      g.fTimeFormat = 1;
-    }else{
-      g.fTimeFormat = 2;
+void test_timewarp_page(void){
+  Stmt q;
+  int cnt = 0;
+
+  login_check_credentials();
+  if( !g.perm.Read || !g.perm.Hyperlink ){
+    login_needed(g.anon.Read && g.anon.Hyperlink);
+    return;
+  }
+  style_header("Instances of timewarp");
+  db_prepare(&q,
+     "SELECT blob.uuid, "
+     "       date(ce.mtime),"
+     "       pe.mtime>ce.mtime,"
+     "       coalesce(ce.euser,ce.user)"
+     "  FROM plink p, plink c, blob, event pe, event ce"
+     " WHERE p.cid=c.pid  AND p.mtime>c.mtime"
+     "   AND blob.rid=c.cid"
+     "   AND pe.objid=p.cid"
+     "   AND ce.objid=c.cid"
+     " ORDER BY 2 DESC"
+  );
+  while( db_step(&q)==SQLITE_ROW ){
+    const char *zCkin = db_column_text(&q, 0);
+    const char *zDate = db_column_text(&q, 1);
+    const char *zStatus = db_column_int(&q,2) ? "Open"
+                                 : "Resolved by editing date";
+    const char *zUser = db_column_text(&q, 3);
+    char *zHref = href("%R/timeline?c=%S", zCkin);
+    if( cnt==0 ){
+      @ <div class="brlist"><table id="timewarptable">
+      @ <thead><tr>
+      @ <th>Check-in</th>
+      @ <th>Date</th>
+      @ <th>User</th>
+      @ <th>Status</th>
+      @ </tr></thead><tbody>
     }
+    @ <tr>
+    @ <td>%s(zHref)%S(zCkin)</a></td>
+    @ <td>%s(zHref)%s(zDate)</a></td>
+    @ <td>%h(zUser)</td>
+    @ <td>%s(zStatus)</td>
+    @ </tr>
+    fossil_free(zHref);
+    cnt++;
   }
-  if( g.fTimeFormat==1 ){
-    return gmtime(clock);
+  db_finalize(&q);
+  if( cnt==0 ){
+    @ <p>No timewarps in this repository</p>
   }else{
-    return localtime(clock);
+    @ </tbody></table></div>
+    output_table_sorting_javascript("timewarptable","tttt",2);
   }
+  style_footer();
 }

@@ -15,8 +15,11 @@
 **
 *******************************************************************************
 **
-** begin with the "@" character are translated into cgi_printf() statements
-** and the translated code is written on standard output.
+** SYNOPSIS:
+**
+** Input lines that begin with the "@" character are translated into
+** either cgi_printf() statements or string literals and the
+** translated code is written on standard output.
 **
 ** The problem this program is attempt to solve is as follows:  When
 ** writing CGI programs in C, we typically want to output a lot of HTML
@@ -29,6 +32,22 @@
 ** the middle of a C program.  This program then translates the text
 ** into standard C by inserting all necessary backslashes and other
 ** punctuation.
+**
+** Enhancement #1:
+**
+** If the last non-whitespace character prior to the first "@" of a
+** @-block is "=" or "," then the @-block is a string literal initializer
+** rather than text that is to be output via cgi_printf().  Render it
+** as such.
+**
+** Enhancement #2:
+**
+** Comments of the form:  "|* @-comment: CC" (where "|" is really "/")
+** cause CC to become a comment character for the @-substitution.
+** Typical values for CC are "--" (for SQL text) or "#" (for Tcl script)
+** or "//" (for C++ code).  Lines of subsequent @-blocks that begin with
+** CC are omitted from the output.
+**
 */
 #include <stdio.h>
 #include <ctype.h>
@@ -105,7 +124,7 @@ static void trans(FILE *in, FILE *out){
       omitline = 0;
       for(j=0; zLine[i] && zLine[i]!='\r' && zLine[i]!='\n'; i++){
         if( zLine[i]==c1 && (c2==' ' || zLine[i+1]==c2) ){
-           omitline = 1; break; 
+           omitline = 1; break;
         }
         if( zLine[i]=='"' || zLine[i]=='\\' ){ zOut[j++] = '\\'; }
         zOut[j++] = zLine[i];
@@ -120,11 +139,13 @@ static void trans(FILE *in, FILE *out){
     }else{
       /* Otherwise (if the last non-whitespace was not '=') then generate
       ** a cgi_printf() statement whose format is the text following the '@'.
-      ** Substrings of the form "%C(...)" where C is any character will
-      ** puts "%C" in the format and add the "..." as an argument to the
-      ** cgi_printf call.
+      ** Substrings of the form "%C(...)" (where C is any sequence of
+      ** characters other than \000 and '(') will put "%C" in the
+      ** format and add the "(...)" as an argument to the cgi_printf call.
       */
       int indent;
+      int nC;
+      char c;
       i++;
       if( isspace(zLine[i]) ){ i++; }
       indent = i;
@@ -132,20 +153,20 @@ static void trans(FILE *in, FILE *out){
         if( zLine[i]=='"' || zLine[i]=='\\' ){ zOut[j++] = '\\'; }
         zOut[j++] = zLine[i];
         if( zLine[i]!='%' || zLine[i+1]=='%' || zLine[i+1]==0 ) continue;
-        if( zLine[i+2]!='(' ) continue;
-        i++;
-        zOut[j++] = zLine[i];
+        for(nC=1; zLine[i+nC] && zLine[i+nC]!='('; nC++){}
+        if( zLine[i+nC]!='(' || !isalpha(zLine[i+nC-1]) ) continue;
+        while( --nC ) zOut[j++] = zLine[++i];
         zArg[nArg++] = ',';
-        i += 2;
-        k = 1;
-        while( zLine[i] ){
-          if( zLine[i]==')' ){
+        k = 0; i++;
+        while( (c = zLine[i])!=0 ){
+          zArg[nArg++] = c;
+          if( c==')' ){
             k--;
             if( k==0 ) break;
-          }else if( zLine[i]=='(' ){
+          }else if( c=='(' ){
             k++;
           }
-          zArg[nArg++] = zLine[i++];
+          i++;
         }
       }
       zOut[j] = 0;
@@ -155,17 +176,27 @@ static void trans(FILE *in, FILE *out){
       }else{
         fprintf(out,"\n%*s\"%s\\n\"",indent+5, "", zOut);
       }
-    }      
+    }
   }
 }
 
 int main(int argc, char **argv){
   if( argc==2 ){
+    char *arg;
     FILE *in = fopen(argv[1], "r");
     if( in==0 ){
       fprintf(stderr,"can not open %s\n", argv[1]);
       exit(1);
     }
+    printf("#line 1 \"");
+    for(arg=argv[1]; *arg; arg++){
+      if( *arg!='\\' ){
+        printf("%c", *arg);
+      }else{
+        printf("\\\\");
+      }
+    }
+    printf("\"\n");
     trans(in, stdout);
     fclose(in);
   }else{

@@ -24,6 +24,10 @@
 ** than 2 or 3 elements, so a simple array is sufficient as the
 ** implementation.  This could give worst case O(N) insert times,
 ** but because of the nature of the problem we expect O(1) performance.
+**
+** Compatibility note:  Some versions of OpenSSL export a symbols
+** like "pqueue_insert".  This is, technically, a bug in OpenSSL.
+** We work around it here by using "pqueuex_" instead of "pqueue_".
 */
 #include "config.h"
 #include "pqueue.h"
@@ -40,6 +44,7 @@ struct PQueue {
   int sz;    /* Number of slots in a[] */
   struct QueueElement {
     int id;          /* ID of the element */
+    void *p;         /* Content pointer */
     double value;    /* Value of element.  Kept in ascending order */
   } *a;
 };
@@ -48,33 +53,33 @@ struct PQueue {
 /*
 ** Initialize a PQueue structure
 */
-void pqueue_init(PQueue *p){
+void pqueuex_init(PQueue *p){
   memset(p, 0, sizeof(*p));
 }
 
 /*
 ** Destroy a PQueue.  Delete all of its content.
 */
-void pqueue_clear(PQueue *p){
+void pqueuex_clear(PQueue *p){
   free(p->a);
-  pqueue_init(p);
+  pqueuex_init(p);
 }
 
 /*
 ** Change the size of the queue so that it contains N slots
 */
-static void pqueue_resize(PQueue *p, int N){
-  p->a = realloc(p->a, sizeof(p->a[0])*N);
+static void pqueuex_resize(PQueue *p, int N){
+  p->a = fossil_realloc(p->a, sizeof(p->a[0])*N);
   p->sz = N;
 }
 
 /*
 ** Insert element e into the queue.
 */
-void pqueue_insert(PQueue *p, int e, double v){
+void pqueuex_insert(PQueue *p, int e, double v, void *pData){
   int i, j;
   if( p->cnt+1>p->sz ){
-    pqueue_resize(p, p->cnt+5);
+    pqueuex_resize(p, p->cnt+5);
   }
   for(i=0; i<p->cnt; i++){
     if( p->a[i].value>v ){
@@ -85,6 +90,7 @@ void pqueue_insert(PQueue *p, int e, double v){
     }
   }
   p->a[i].id = e;
+  p->a[i].p = pData;
   p->a[i].value = v;
   p->cnt++;
 }
@@ -94,12 +100,14 @@ void pqueue_insert(PQueue *p, int e, double v){
 ** the smallest value) and return its ID.  Return 0 if the queue
 ** is empty.
 */
-int pqueue_extract(PQueue *p){
+int pqueuex_extract(PQueue *p, void **pp){
   int e, i;
   if( p->cnt==0 ){
+    if( pp ) *pp = 0;
     return 0;
   }
   e = p->a[0].id;
+  if( pp ) *pp = p->a[0].p;
   for(i=0; i<p->cnt-1; i++){
     p->a[i] = p->a[i+1];
   }

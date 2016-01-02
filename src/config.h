@@ -27,6 +27,20 @@
 #endif
 #define _LARGEFILE_SOURCE 1
 
+/* Needed for various definitions... */
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE
+#endif
+
+/* Make sure that in Win32 MinGW builds, _USE_32BIT_TIME_T is always defined. */
+#if defined(_WIN32) && !defined(_WIN64) && !defined(_MSC_VER) && !defined(_USE_32BIT_TIME_T)
+#  define _USE_32BIT_TIME_T
+#endif
+
+#ifdef HAVE_AUTOCONFIG_H
+#include "autoconfig.h"
+#endif
+
 #ifndef _RC_COMPILE_
 
 /*
@@ -35,7 +49,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
+/* #include <ctype.h> // do not use - causes problems */
 #include <string.h>
 #include <stdarg.h>
 #include <assert.h>
@@ -56,86 +70,115 @@
 #endif
 
 /*
+** Utility macro to wrap an argument with double quotes.
+*/
+#if !defined(COMPILER_STRINGIFY)
+#  define COMPILER_STRINGIFY(x)  COMPILER_STRINGIFY1(x)
+#  define COMPILER_STRINGIFY1(x) #x
+#endif
+
+/*
 ** Define the compiler variant, used to compile the project
 */
 #if !defined(COMPILER_NAME)
 #  if defined(__DMC__)
-#    define COMPILER_NAME "dmc"
+#    if defined(COMPILER_VERSION) && !defined(NO_COMPILER_VERSION)
+#      define COMPILER_NAME "dmc-" COMPILER_VERSION
+#    else
+#      define COMPILER_NAME "dmc"
+#    endif
 #  elif defined(__POCC__)
 #    if defined(_M_X64)
-#      define COMPILER_NAME "pellesc64"
+#      if defined(COMPILER_VERSION) && !defined(NO_COMPILER_VERSION)
+#        define COMPILER_NAME "pellesc64-" COMPILER_VERSION
+#      else
+#        define COMPILER_NAME "pellesc64"
+#      endif
 #    else
-#      define COMPILER_NAME "pellesc32"
+#      if defined(COMPILER_VERSION) && !defined(NO_COMPILER_VERSION)
+#        define COMPILER_NAME "pellesc32-" COMPILER_VERSION
+#      else
+#        define COMPILER_NAME "pellesc32"
+#      endif
 #    endif
 #  elif defined(_MSC_VER)
-#    define COMPILER_NAME "msc"
+#    if !defined(COMPILER_VERSION)
+#      define COMPILER_VERSION COMPILER_STRINGIFY(_MSC_VER)
+#    endif
+#    if defined(COMPILER_VERSION) && !defined(NO_COMPILER_VERSION)
+#      define COMPILER_NAME "msc-" COMPILER_VERSION
+#    else
+#      define COMPILER_NAME "msc"
+#    endif
 #  elif defined(__MINGW32__)
-#    define COMPILER_NAME "mingw32"
+#    if !defined(COMPILER_VERSION)
+#      if defined(__MINGW_VERSION)
+#        if defined(__GNUC__)
+#          if defined(__VERSION__)
+#            define COMPILER_VERSION COMPILER_STRINGIFY(__MINGW_VERSION) "-gcc-" __VERSION__
+#          else
+#            define COMPILER_VERSION COMPILER_STRINGIFY(__MINGW_VERSION) "-gcc"
+#          endif
+#        else
+#          define COMPILER_VERSION COMPILER_STRINGIFY(__MINGW_VERSION)
+#        endif
+#      elif defined(__MINGW32_VERSION)
+#        if defined(__GNUC__)
+#          if defined(__VERSION__)
+#            define COMPILER_VERSION COMPILER_STRINGIFY(__MINGW32_VERSION) "-gcc-" __VERSION__
+#          else
+#            define COMPILER_VERSION COMPILER_STRINGIFY(__MINGW32_VERSION) "-gcc"
+#          endif
+#        else
+#          define COMPILER_VERSION COMPILER_STRINGIFY(__MINGW32_VERSION)
+#        endif
+#      endif
+#    endif
+#    if defined(COMPILER_VERSION) && !defined(NO_COMPILER_VERSION)
+#      define COMPILER_NAME "mingw32-" COMPILER_VERSION
+#    else
+#      define COMPILER_NAME "mingw32"
+#    endif
 #  elif defined(_WIN32)
 #    define COMPILER_NAME "win32"
 #  elif defined(__GNUC__)
-#    define COMPILER_NAME "gcc-" __VERSION__
+#    if !defined(COMPILER_VERSION)
+#      if defined(__VERSION__)
+#        define COMPILER_VERSION __VERSION__
+#      endif
+#    endif
+#    if defined(COMPILER_VERSION) && !defined(NO_COMPILER_VERSION)
+#      define COMPILER_NAME "gcc-" COMPILER_VERSION
+#    else
+#      define COMPILER_NAME "gcc"
+#    endif
 #  else
 #    define COMPILER_NAME "unknown"
 #  endif
 #endif
 
-#ifndef _RC_COMPILE_
+#if !defined(_RC_COMPILE_) && !defined(SQLITE_AMALGAMATION)
 
 #include "sqlite3.h"
 
 /*
+** On Solaris, getpass() will only return up to 8 characters. getpassphrase() returns up to 257.
+*/
+#if HAVE_GETPASSPHRASE
+  #define getpass getpassphrase
+#endif
+
+/*
 ** Typedef for a 64-bit integer
 */
-typedef sqlite_int64 i64;
-typedef sqlite_uint64 u64;
+typedef sqlite3_int64 i64;
+typedef sqlite3_uint64 u64;
 
 /*
-** Unsigned character type
+** 8-bit types
 */
 typedef unsigned char u8;
-
-/*
-** Standard colors.  These colors can also be changed using a stylesheet.
-*/
-
-/* A blue border and background.  Used for the title bar and for dates
-** in a timeline.
-*/
-#define BORDER1       "#a0b5f4"      /* Stylesheet class: border1 */
-#define BG1           "#d0d9f4"      /* Stylesheet class: bkgnd1 */
-
-/* A red border and background.  Use for releases in the timeline.
-*/
-#define BORDER2       "#ec9898"      /* Stylesheet class: border2 */
-#define BG2           "#f7c0c0"      /* Stylesheet class: bkgnd2 */
-
-/* A gray background.  Used for column headers in the Wiki Table of Contents
-** and to highlight ticket properties.
-*/
-#define BG3           "#d0d0d0"      /* Stylesheet class: bkgnd3 */
-
-/* A light-gray background.  Used for title bar, menus, and rlog alternation
-*/
-#define BG4           "#f0f0f0"      /* Stylesheet class: bkgnd4 */
-
-/* A deeper gray background.  Used for branches
-*/
-#define BG5           "#dddddd"      /* Stylesheet class: bkgnd5 */
-
-/* Default HTML page header */
-#define HEADER "<html>\n" \
-               "<head>\n" \
-               "<link rel=\"alternate\" type=\"application/rss+xml\"\n" \
-               "   title=\"%N Timeline Feed\" href=\"%B/timeline.rss\">\n" \
-               "<title>%N: %T</title>\n</head>\n" \
-               "<body bgcolor=\"white\">"
-
-/* Default HTML page footer */
-#define FOOTER "<div id=\"footer\"><small><small>\n" \
-               "<a href=\"about\">Fossil version %V</a>\n" \
-               "</small></small></div>\n" \
-               "</body></html>\n"
+typedef signed char i8;
 
 /* In the timeline, check-in messages are truncated at the first space
 ** that is more than MX_CKIN_MSG from the beginning, or at the first
@@ -144,18 +187,35 @@ typedef unsigned char u8;
 #define MN_CKIN_MSG   100
 #define MX_CKIN_MSG   300
 
-/* Unset the following to disable internationalization code. */
-#ifndef FOSSIL_I18N
-# define FOSSIL_I18N 1
+/*
+** The following macros are used to cast pointers to integers and
+** integers to pointers.  The way you do this varies from one compiler
+** to the next, so we have developed the following set of #if statements
+** to generate appropriate macros for a wide range of compilers.
+**
+** The correct "ANSI" way to do this is to use the intptr_t type.
+** Unfortunately, that typedef is not available on all compilers, or
+** if it is available, it requires an #include of specific headers
+** that vary from one machine to the next.
+*/
+#if defined(__PTRDIFF_TYPE__)  /* This case should work for GCC */
+# define FOSSIL_INT_TO_PTR(X)  ((void*)(__PTRDIFF_TYPE__)(X))
+# define FOSSIL_PTR_TO_INT(X)  ((int)(__PTRDIFF_TYPE__)(X))
+#elif !defined(__GNUC__)       /* Works for compilers other than LLVM */
+# define FOSSIL_INT_TO_PTR(X)  ((void*)&((char*)0)[X])
+# define FOSSIL_PTR_TO_INT(X)  ((int)(((char*)X)-(char*)0))
+#else                          /* Generates a warning - but it always works */
+# define FOSSIL_INT_TO_PTR(X)  ((void*)(X))
+# define FOSSIL_PTR_TO_INT(X)  ((int)(X))
 #endif
 
-#if FOSSIL_I18N
-# include <locale.h>
-# include <langinfo.h>
-#endif
-#ifndef CODESET
-# undef FOSSIL_I18N
-# define FOSSIL_I18N 0
+/*
+** A marker for functions that never return.
+*/
+#if defined(__GNUC__) || defined(__clang__)
+# define NORETURN __attribute__((__noreturn__))
+#else
+# define NORETURN
 #endif
 
-#endif
+#endif /* _RC_COMPILE_ */
