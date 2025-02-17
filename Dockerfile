@@ -74,7 +74,7 @@ COPY --from=os  --chmod=600           /e/*        /etc/
 COPY --from=os  --chmod=1777          /tmp        /tmp/
 COPY --from=os  --chown=fossil:fossil /log        /log/
 COPY --from=os  --chown=fossil:fossil /museum     /museum/
-
+COPY            --chown=fossil:fossil fossil-scm.fossil /museum/
 
 ## ---------------------------------------------------------------------
 ## RUN!
@@ -85,7 +85,7 @@ EXPOSE 8080/tcp
 USER fossil
 ENTRYPOINT [ "fossil", "server" ]
 CMD [                       \
-    "--create",             \
+    "--https",              \
     "--jsmode", "bundled",  \
-    "--user",   "admin",    \
-    "museum/repo.fossil" ]
+    "--user",   "jkridner", \
+    "museum/fossil-scm.fossil" ]
