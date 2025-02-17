@@ -1,5 +1,5 @@
-C Add\ssetup\sfor\sown\sserver,\sserve\sfossil\sitself
-D 2025-02-17T16:47:20.109
+C Set\sbaseurl
+D 2025-02-17T16:54:52.533
 F .editorconfig 132c5a213aa3ce13dcc9c19f8a7ea306e3640bec4ae693378116cee339c34a1a
 F .fossil-settings/binary-glob 679cf0b793f345a23e6dab55174511758d5fa28dd7724f61bab41d2b75c288c2
 F .fossil-settings/clean-glob 3efaf2f54ed450047dea396ef7197ab4a7596654d844ce25c419cc442e2f493f
@@ -11,7 +11,7 @@ F .settings/org.eclipse.core.resources.prefs 6d8a06b0a3395c74037897476eadb764d7f
 F .settings/org.eclipse.core.runtime.prefs 6cc9381da1eff8e6dac0e41121d3cce3f1b4761b
 F BUILD.txt a92d9dc35ad8b4dfb7c1e35278362da66ccbc5a41ee6decdd8727e17fd4542e0
 F COPYRIGHT-BSD2.txt f99187d1905883d3b3cff4c5f97687290b1f3edf
-F Dockerfile 9df53783e73d48cee12ef9ffa9ee41353c987ccee21654904cf2390929f0e647
+F Dockerfile f43657187fed13378dcabddf22b18628170fd1dac6c458aca8b6bc7c76823d0f
 F Makefile.classic 25ea72b6fe8959b5bbd638363af82dec3ba475c09ea79918deda199eb15c3d3a
 F Makefile.in 6b80e22f5e70b9a47d4f1491547b1d68c294c12cdf21be39311bc6fdc143618f x
 F Makefile.osx-jaguar 1ef6fd900a465cbfab191ae03df559cb6a309131cdf9bebbd7ed38fe4d7cb674
@@ -965,8 +965,8 @@ F www/whyusefossil.wiki 5678210f5e82178b9e4104f19e4b43c87ea824663e294b8cbcc5503c
 F www/wikitheory.wiki 9f664eb4fa24d97afbe2b1375d78069a5ad534c36c40f003bcdf5f428692771d
 F www/wsl_caveats.wiki dc4a8388b29d05641ad4d9769c18cbe49963d000dbdc3a9dd6f616ccbcf12dea
 F www/xkcd-git.gif 1f9bc44ed41cad3f5ac18f21e3463e3390b53b29
-P f8e522e4673c698b063f2de8e0c1d6a2c4251fb641dd9e87b179cf010dce108d
-R 60fbaa74b58aeeca708009202dbdd82d
+P ef854e3c30eca1ba6f14c6f7b5966cf58e6a827e11d720773440b52aada4033e
+R 0a5a4520455b8c884ad9999aa75c505b
 U jkridner
-Z 3511c807094fe36d5e8262eb6c3c49f2
+Z d497c59f68426634213286b58746fdc8
 # Remove this line to create a well-formed Fossil manifest.

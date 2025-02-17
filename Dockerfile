@@ -86,6 +86,7 @@ USER fossil
 ENTRYPOINT [ "fossil", "server" ]
 CMD [                       \
     "--https",              \
+    "--baseurl", "https://blabl.space",  \
     "--jsmode", "bundled",  \
     "--user",   "jkridner", \
     "museum/fossil-scm.fossil" ]
